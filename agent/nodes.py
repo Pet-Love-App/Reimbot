@@ -209,9 +209,6 @@ def consistency_check_node(state: AgentState) -> AgentState:
     }
 
 
-# 模拟内存数据库用于防重发票
-_PROCESSED_INVOICES = set()
-
 def compliance_audit_node(state: AgentState) -> AgentState:
     config = get_audit_config()
     actual_df = state["actual_df"].copy()
