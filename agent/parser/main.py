@@ -1,3 +1,4 @@
+
 """
 agent/parser/main.py
 
@@ -12,6 +13,7 @@ import json
 import logging
 from pathlib import Path
 from typing import Any
+from datetime import datetime  # ========== 新增：导入时间模块，用于MD文件时间戳 ==========
 
 from agent.parser.router import FileRouter
 from agent.parser.output.writer import ParsedOutputWriter
@@ -30,6 +32,51 @@ SUPPORTED_EXTENSIONS = {
     ".pdf", ".docx", ".pptx", ".xlsx", ".xls",
     ".md", ".markdown", ".txt",
 }
+
+
+# ========== 新增：生成单个文件的Warnings/Errors MD文件 ==========
+def generate_warnings_errors_md(
+    result: dict[str, Any],
+    doc_dir: Path,
+    warnings: list[str],
+    errors: list[str]
+) -> None:
+    """
+    为单个解析文件生成 warnings_errors.md 文件，存放在该文件的解析目录下。
+    """
+    md_path = doc_dir / "warnings_errors.md"
+    
+    # Markdown 内容模板
+    md_content = f"""# 解析警告与错误记录
+**文件路径**: {result['file_path']}
+**Doc ID**: {result['doc_id']}
+**解析状态**: {result['status']}
+**生成时间**: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+
+---
+
+## ⚠️ 警告 (共 {len(warnings)} 条)
+"""
+    # 追加警告内容
+    if warnings:
+        for idx, warn in enumerate(warnings, 1):
+            md_content += f"{idx}. {warn}\n\n"
+    else:
+        md_content += "无警告\n\n"
+    
+    md_content += f"## ❌ 错误 (共 {len(errors)} 条)\n"    
+    # 追加错误内容
+    if errors:
+        for idx, err in enumerate(errors, 1):
+            md_content += f"{idx}. {err}\n\n"
+    else:
+        md_content += "无错误\n\n"
+    
+    # 写入MD文件
+    with open(md_path, "w", encoding="utf-8") as f:
+        f.write(md_content)
+    
+    logger.info(f"    📝 Warnings/Errors MD saved to: {md_path}")
 
 
 def parse_single_file(
@@ -54,15 +101,28 @@ def parse_single_file(
             "format": str(doc_dir / "tables" / f"{tb.meta.table_id}.format.json"),
         })
 
-    return {
+    # ========== 修改：格式化warnings/errors为字符串列表（兼容不同类型的警告/错误对象） ==========
+    formatted_warnings = [str(w) for w in doc.warnings]
+    formatted_errors = [str(e) for e in doc.errors]
+
+    # ========== 新增：调用MD生成函数 ==========
+    result_base = {
         "file_path": file_path,
         "doc_id": doc.doc_id,
         "status": doc.status,
         "parsed_dir": str(doc_dir),
         "tables": tables_info,
         "title": doc.title,
-        "warnings_count": len(doc.warnings),
-        "errors_count": len(doc.errors),
+        "warnings_count": len(formatted_warnings),
+        "errors_count": len(formatted_errors),
+    }
+    generate_warnings_errors_md(result_base, doc_dir, formatted_warnings, formatted_errors)
+
+    # ========== 修改：返回结果中追加warnings/errors详情 ==========
+    return {
+        **result_base,
+        "warnings": formatted_warnings,  # 追加警告详情
+        "errors": formatted_errors,      # 追加错误详情
     }
 
 
@@ -125,13 +185,31 @@ def parse_directory(
                 f"warnings={result['warnings_count']} "
                 f"errors={result['errors_count']}"
             )
+            
+            # ========== 新增：日志中打印具体的警告/错误（可选，提升控制台可读性） ==========
+            if result.get("warnings"):
+                for idx, warn in enumerate(result["warnings"], 1):
+                    logger.warning(f"    🚨 Warning [{idx}]: {warn}")
+            if result.get("errors"):
+                for idx, err in enumerate(result["errors"], 1):
+                    logger.error(f"    💥 Error [{idx}]: {err}")
+                    
         except Exception as exc:
-            results.append({
+            # ========== 修改：异常场景下也补充warnings/errors字段，保证结构统一 ==========
+            error_result = {
                 "file_path": str(fpath),
                 "doc_id": "",
                 "status": "error",
                 "error": str(exc),
-            })
+                "warnings_count": 0,
+                "errors_count": 1,
+                "warnings": [],
+                "errors": [str(exc)],  # 异常信息作为错误列表
+                "parsed_dir": "",
+                "tables": [],
+                "title": "",
+            }
+            results.append(error_result)
             logger.error(f"  ❌ FAILED: {exc}")
 
     # 生成 manifest.json（放在 parsed_dir 下）
