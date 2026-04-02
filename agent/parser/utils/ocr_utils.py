@@ -1,7 +1,7 @@
 """
 agent/parser/utils/ocr_utils.py
 
-OCR 工具 —— 通过 PaddleOCR-VL-1.5 API (Paratera 平台) 实现。
+OCR 工具 —— 通过 ds API (Paratera 平台) 实现。
 API 文档: https://ai.paratera.com/document/llm/quickStart/useApi
 
 调用方式：OpenAI 兼容的 Chat Completions 接口，发送 base64 图片。
@@ -29,7 +29,7 @@ PARATERA_API_BASE = os.environ.get(
     "PARATERA_API_BASE", "https://llmapi.paratera.com"
 )
 PARATERA_OCR_MODEL = os.environ.get(
-    "PARATERA_OCR_MODEL", "PaddleOCR-VL-1.5"
+    "PARATERA_OCR_MODEL", "DeepSeek-OCR"
 )
 
 # 重试配置
@@ -45,7 +45,7 @@ def run_ocr(image_bytes: bytes, detail: str = "high") -> str:
     """
     对图片字节执行 OCR，返回识别文本。
 
-    使用 PaddleOCR-VL-1.5 (Paratera 平台 OpenAI 兼容接口)。
+    使用 ds (Paratera 平台 OpenAI 兼容接口)。
     图片以 base64 编码发送。
 
     Args:
@@ -174,6 +174,7 @@ def run_ocr(image_bytes: bytes, detail: str = "high") -> str:
             return f"[OCR ERROR: {exc}]"
 
     return "[OCR ERROR: All retries exhausted]"
+
 
 
 def run_ocr_on_file(image_path: str, detail: str = "high") -> str:
