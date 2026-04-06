@@ -262,10 +262,43 @@ def search_policy(query: str, top_k: int = 3, kb_path: Optional[str | Path] = No
 
     query_tokens = _tokenize(query)
     candidate_limit = max(top_k * 8, 12)
+    
+    # 步骤1：先计算文件级别的分数，找到最匹配的文件
+    file_scores: Dict[str, float] = {}
+    for item in chunks:
+        if not isinstance(item, dict):
+            continue
+        source = str(item.get("source", "未知来源"))
+        content = str(item.get("content", ""))
+        title = str(item.get("title", ""))
+        text_to_score = f"{title}\n{content}"
+        
+        score = _score_chunk(query, query_tokens, {"content": text_to_score})
+        if score > 0:
+            if source not in file_scores or score > file_scores[source]:
+                file_scores[source] = score
+    
+    # 选出得分最高的前几个文件（比如前3个）
+    top_files = set()
+    if file_scores:
+        sorted_files = sorted(file_scores.keys(), key=lambda k: file_scores[k], reverse=True)
+        top_files = set(sorted_files[:3])
+    
+    # 过滤出这些文件中的chunks
+    filtered_chunks = []
+    if top_files:
+        for item in chunks:
+            if not isinstance(item, dict):
+                continue
+            if item.get("source") in top_files:
+                filtered_chunks.append(item)
+    else:
+        filtered_chunks = chunks
+
     keyword_candidates = _collect_keyword_candidates(
         query,
         query_tokens,
-        chunks,  # type: ignore[arg-type]
+        filtered_chunks,  # type: ignore[arg-type]
         limit=candidate_limit,
     )
 
@@ -309,6 +342,9 @@ def search_policy(query: str, top_k: int = 3, kb_path: Optional[str | Path] = No
 
                 for doc, meta, distance in zip(docs, metas, distances):
                     source = str(meta.get("source", "未知来源"))
+                    if top_files and source not in top_files:
+                        continue
+                    
                     title = str(meta.get("title", "未命名片段"))
                     content = str(meta.get("content", doc)).strip()
                     if not content:
@@ -348,6 +384,9 @@ def search_policy(query: str, top_k: int = 3, kb_path: Optional[str | Path] = No
         for idx in order[: min(len(order), candidate_limit)]:
             meta = metadata[idx]
             source = str(meta.get("source", "未知来源"))
+            if top_files and source not in top_files:
+                continue
+
             title = str(meta.get("title", "未命名片段"))
             content = str(meta.get("content", "")).strip()
             if not content:
