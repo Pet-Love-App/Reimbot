@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import json
 import re
+import logging
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
+logger = logging.getLogger(__name__)
 
 @dataclass
 class RetrievedChunk:
@@ -147,6 +149,56 @@ def _collect_keyword_candidates(
     return scored[: max(1, limit)]
 
 
+def _detect_antonym_conflict(query: str, content: str) -> bool:
+    """
+    第三层：基于规则的简单语义与反义词冲突检测器
+    例如：query中包含"不能超过"，但content中是"不能少于"之类
+    """
+    negations = ["不", "不能", "不可", "严禁", "禁止", "不得"]
+    # 简单启发式：如果query和content在强否定词或方向性词汇上完全相反，可视为冲突
+    # 这里只是一个占位或基础实现
+    if "不能超过" in query and "不能少于" in content:
+        return True
+    if "可以" in query and "严禁" in content and "不可以" not in query:
+        # 具体逻辑需要根据实际业务调整
+        pass
+    return False
+
+
+def _rrf_fusion(
+    keyword_ranked: List[RetrievedChunk],
+    vector_ranked: List[RetrievedChunk],
+    k: int = 60
+) -> List[RetrievedChunk]:
+    """
+    第二层：RRF (Reciprocal Rank Fusion) 融合多路召回结果
+    """
+    rrf_scores: Dict[Tuple[str, str, str], float] = {}
+    chunk_map: Dict[Tuple[str, str, str], RetrievedChunk] = {}
+
+    for rank, chunk in enumerate(keyword_ranked):
+        key = _candidate_key(chunk.source, chunk.title, chunk.content)
+        rrf_scores[key] = rrf_scores.get(key, 0.0) + 1.0 / (k + rank + 1)
+        chunk_map[key] = chunk
+
+    for rank, chunk in enumerate(vector_ranked):
+        key = _candidate_key(chunk.source, chunk.title, chunk.content)
+        rrf_scores[key] = rrf_scores.get(key, 0.0) + 1.0 / (k + rank + 1)
+        if key not in chunk_map:
+            chunk_map[key] = chunk
+            chunk_map[key].score = chunk.score # 保留原本的一些基础分
+
+    # 将RRF分数赋给chunk的score字段用于最终排序
+    fused = []
+    for key, score in rrf_scores.items():
+        chunk = chunk_map[key]
+        chunk.score = score
+        fused.append(chunk)
+        
+    fused.sort(key=lambda x: x.score, reverse=True)
+    return fused
+
+
 def _build_kb_signature(kb_path: Path, chunks: Sequence[Dict[str, object]]) -> str:
     try:
         st = kb_path.stat()
@@ -245,9 +297,7 @@ def format_retrieved_context(chunks: Sequence[RetrievedChunk], *, max_chars: int
 # ---------------------------
 def search_policy(query: str, top_k: int = 3, kb_path: Optional[str | Path] = None) -> List[RetrievedChunk]:
     """
-    使用向量检索来返回与 query 最相关的片段。
-
-    返回值: List[RetrievedChunk]，每个包含 source（原文件路径或来源标识）、title（制度名称）、content（片段正文）、score（相似度分数）。
+    使用分层多维度的向量与词频混合检索来返回与 query 最相关的片段。
     """
     if not query or not query.strip():
         return []
@@ -261,9 +311,9 @@ def search_policy(query: str, top_k: int = 3, kb_path: Optional[str | Path] = No
         return []
 
     query_tokens = _tokenize(query)
-    candidate_limit = max(top_k * 8, 12)
+    candidate_limit = max(top_k * 8, 20)
     
-    # 步骤1：先计算文件级别的分数，找到最匹配的文件
+    # 步骤1：先计算文件级别的分数，找到最匹配的文件（第一层前置过滤）
     file_scores: Dict[str, float] = {}
     for item in chunks:
         if not isinstance(item, dict):
@@ -278,13 +328,11 @@ def search_policy(query: str, top_k: int = 3, kb_path: Optional[str | Path] = No
             if source not in file_scores or score > file_scores[source]:
                 file_scores[source] = score
     
-    # 选出得分最高的前几个文件（比如前3个）
     top_files = set()
     if file_scores:
         sorted_files = sorted(file_scores.keys(), key=lambda k: file_scores[k], reverse=True)
         top_files = set(sorted_files[:3])
     
-    # 过滤出这些文件中的chunks
     filtered_chunks = []
     if top_files:
         for item in chunks:
@@ -295,28 +343,31 @@ def search_policy(query: str, top_k: int = 3, kb_path: Optional[str | Path] = No
     else:
         filtered_chunks = chunks
 
+    # 第一层：多路检索 - 关键词/稀疏检索路
     keyword_candidates = _collect_keyword_candidates(
         query,
         query_tokens,
         filtered_chunks,  # type: ignore[arg-type]
         limit=candidate_limit,
     )
-
-    resolved_path = Path(kb_path).resolve()
-    db_path = resolved_path.parent / "chroma_db"
-    merged: Dict[Tuple[str, str, str], RetrievedChunk] = {}
-
+    
+    keyword_ranked = []
     for item, keyword_score in keyword_candidates:
         source = str(item.get("source", "未知来源"))
         title = str(item.get("title", "未命名片段"))
         content = str(item.get("content", "")).strip()
         if not content:
             continue
-        combined = _to_hybrid_score(0.0, keyword_score)
-        key = _candidate_key(source, title, content)
-        merged[key] = RetrievedChunk(source=source, title=title, content=content, score=combined)
+        # 第三层：反义词和语义冲突硬过滤
+        if _detect_antonym_conflict(query, content):
+            continue
+        keyword_ranked.append(RetrievedChunk(source=source, title=title, content=content, score=keyword_score))
 
-    # Try using ChromaDB first
+    resolved_path = Path(kb_path).resolve()
+    db_path = resolved_path.parent / "chroma_db"
+    
+    vector_ranked = []
+    # 第一层：多路检索 - 稠密向量检索路
     if db_path.exists():
         try:
             import chromadb
@@ -347,67 +398,57 @@ def search_policy(query: str, top_k: int = 3, kb_path: Optional[str | Path] = No
                     
                     title = str(meta.get("title", "未命名片段"))
                     content = str(meta.get("content", doc)).strip()
-                    if not content:
+                    if not content or _detect_antonym_conflict(query, content):
                         continue
+                        
                     vector_score = 1.0 / (1.0 + float(distance))
-                    keyword_score = _score_chunk(query, query_tokens, {"content": content})
-                    combined = _to_hybrid_score(vector_score, keyword_score)
-                    key = _candidate_key(source, title, content)
-                    current = merged.get(key)
-                    if current is None or combined > current.score:
-                        merged[key] = RetrievedChunk(
-                            source=source,
-                            title=title,
-                            content=content,
-                            score=combined,
-                        )
-            if merged:
-                ranked = sorted(merged.values(), key=lambda x: x.score, reverse=True)
-                return ranked[: max(1, top_k)]
+                    vector_ranked.append(RetrievedChunk(source=source, title=title, content=content, score=vector_score))
 
         except Exception:
-            # fallback to dynamic embeddings
             pass
 
-    # Fallback to dynamic embeddings + hybrid rerank
-    try:
-        import numpy as np
+    # 如果 ChromaDB 失败或不存在，回退到动态嵌入
+    if not vector_ranked:
+        try:
+            import numpy as np
 
-        _, metadata, emb_matrix = _get_cached_embedding_index(resolved_path, chunks)
-        query_emb = _embed_texts([query])[0]
+            _, metadata, emb_matrix = _get_cached_embedding_index(resolved_path, chunks)
+            query_emb = _embed_texts([query])[0]
 
-        emb_norms = np.linalg.norm(emb_matrix, axis=1)
-        q_norm = np.linalg.norm(query_emb) + 1e-10
-        sims = (emb_matrix @ query_emb) / (emb_norms * q_norm + 1e-12)
-        order = sorted(range(len(sims)), key=lambda i: float(sims[i]), reverse=True)
+            emb_norms = np.linalg.norm(emb_matrix, axis=1)
+            q_norm = np.linalg.norm(query_emb) + 1e-10
+            sims = (emb_matrix @ query_emb) / (emb_norms * q_norm + 1e-12)
+            order = sorted(range(len(sims)), key=lambda i: float(sims[i]), reverse=True)
 
-        for idx in order[: min(len(order), candidate_limit)]:
-            meta = metadata[idx]
-            source = str(meta.get("source", "未知来源"))
-            if top_files and source not in top_files:
-                continue
+            for idx in order[: min(len(order), candidate_limit)]:
+                meta = metadata[idx]
+                source = str(meta.get("source", "未知来源"))
+                if top_files and source not in top_files:
+                    continue
 
-            title = str(meta.get("title", "未命名片段"))
-            content = str(meta.get("content", "")).strip()
-            if not content:
-                continue
-            vector_score = float(sims[idx])
-            keyword_score = _score_chunk(query, query_tokens, {"content": content})
-            combined = _to_hybrid_score(vector_score, keyword_score)
-            key = _candidate_key(source, title, content)
-            current = merged.get(key)
-            if current is None or combined > current.score:
-                merged[key] = RetrievedChunk(
-                    source=source,
-                    title=title,
-                    content=content,
-                    score=combined,
-                )
+                title = str(meta.get("title", "未命名片段"))
+                content = str(meta.get("content", "")).strip()
+                if not content or _detect_antonym_conflict(query, content):
+                    continue
+                
+                vector_score = float(sims[idx])
+                vector_ranked.append(RetrievedChunk(source=source, title=title, content=content, score=vector_score))
+        except Exception:
+            pass
 
-        if merged:
-            ranked = sorted(merged.values(), key=lambda x: x.score, reverse=True)
-            return ranked[: max(1, top_k)]
-        return []
-    except Exception:
-        # 回退到基于词汇的检索
-        return retrieve_chunks(query, kb_path=kb_path, top_k=top_k)
+    # 第一层的可选补充：稀疏向量检索（省略真实第三方库调用的模拟）
+    sparse_ranked = []
+    # ... 在实际生产中这路可由 BM25 配合 Sparse Embedding 提供 ...
+
+    # 第二层：RRF 加权融合 (整合 keyword, vector 以及稀疏等的多路排序)
+    # 此处假设 sparse_ranked 被合并到一起
+    fused_results = _rrf_fusion(keyword_ranked, vector_ranked)
+    
+    # 截取最终需要返回的 top_k 数量
+    final_top_chunks = fused_results[: max(1, top_k)]
+
+    if final_top_chunks:
+        return final_top_chunks
+        
+    # 如果完全失败，回退到最基础的词汇检索
+    return retrieve_chunks(query, kb_path=kb_path, top_k=top_k)
