@@ -673,7 +673,25 @@ export default function App() {
     if (task === "qa") {
       const answer = String(taskResult.answer ?? "");
       const citations = Array.isArray(taskResult.citations) ? taskResult.citations.length : 0;
-      return `\n\n### 任务结果\n- 任务类型: ${TASK_META[task].label}\n- 引用条目: ${citations}\n\n${answer}`;
+      const retrieval = String(taskResult.retrieval ?? "");
+      const confidenceRaw = Number(taskResult.confidence ?? 0);
+      const confidence = Number.isFinite(confidenceRaw) ? confidenceRaw : 0;
+      const needsClarification = Boolean(taskResult.needs_clarification);
+      const clarifyingQuestion = String(taskResult.clarifying_question ?? "");
+      const itemsCountRaw = Number(taskResult.items_count ?? 0);
+      const itemsCount = Number.isFinite(itemsCountRaw) ? itemsCountRaw : 0;
+
+      let lines =
+        `\n\n### 任务结果\n- 任务类型: ${TASK_META[task].label}` +
+        `\n- 引用条目: ${citations}` +
+        `\n- 检索模式: ${retrieval || "unknown"}` +
+        `\n- 候选条目: ${itemsCount}` +
+        `\n- 置信度: ${confidence.toFixed(2)}` +
+        `\n- 需要补充信息: ${needsClarification ? "是" : "否"}`;
+      if (needsClarification && clarifyingQuestion) {
+        lines += `\n- 澄清问题: ${clarifyingQuestion}`;
+      }
+      return `${lines}\n\n${answer}`;
     }
 
     if (task === "reimburse") {
@@ -1258,24 +1276,57 @@ export default function App() {
     <div className="app-layout" ref={appRef}>
       <aside className="sidebar" style={{ flex: `0 0 ${sidebarWidthPx}px` }}>
         <Space direction="vertical" size="small" className="sidebar-header">
-          <Title level={4}>功能面板</Title>
-          <Paragraph>集中处理任务、查看输出并实时预览文件。</Paragraph>
-          <Space size="small" wrap>
-            <Button onClick={toggleMode} size="small">
-              {mode === "dark" ? "切换浅色" : "切换深色"}
+          <div className="sidebar-title-row">
+            <Title level={4}>功能面板</Title>
+            <Text className={`ready-pill ${bridgeReady ? "is-ready" : "is-warn"}`}>
+              {bridgeReady ? "连接正常" : "连接未就绪"}
+            </Text>
+          </div>
+          <Paragraph>按“文件准备 → 发起任务 → 查看结果”的流程操作，上手更快。</Paragraph>
+          <div className="sidebar-steps" aria-label="任务步骤">
+            <span className="sidebar-step is-active">1 选任务</span>
+            <span className="sidebar-step">2 发起任务</span>
+            <span className="sidebar-step">3 查看结果</span>
+          </div>
+          <Button
+            type="primary"
+            className="primary-action-btn"
+            onClick={() => void bridge?.openCompareWindow?.()}
+            disabled={!bridgeReady}
+          >
+            打开比对窗口
+          </Button>
+          <Space size="small" wrap className="sidebar-quick-actions">
+            <Button onClick={() => setInputText(getTaskDemoPrompt(selectedTask))} size="small" disabled={chatLoading || !bridgeReady}>
+              填入示例
             </Button>
             <Button onClick={clearChatMessages} size="small" disabled={chatLoading}>
               清空对话
             </Button>
-            <Button
-              onClick={() => void bridge?.openCompareWindow?.()}
-              size="small"
-              disabled={!bridgeReady}
-            >
-              打开比对窗口
+            <Button onClick={toggleMode} size="small">
+              {mode === "dark" ? "切换浅色" : "切换深色"}
             </Button>
           </Space>
         </Space>
+
+        <Card size="small" className="status-block task-focus-card">
+          <div className="task-focus-header">
+            <Text strong>当前任务</Text>
+            <Select
+              size="small"
+              value={selectedTask}
+              onChange={(value) => setSelectedTask(value as TaskType)}
+              disabled={chatLoading || !bridgeReady}
+              options={[
+                { value: "qa", label: TASK_META.qa.label },
+                { value: "reimburse", label: TASK_META.reimburse.label },
+                { value: "final_account", label: TASK_META.final_account.label },
+                { value: "budget", label: TASK_META.budget.label },
+              ]}
+            />
+          </div>
+          <Text className="task-focus-hint">示例：{TASK_META[selectedTask].demo}</Text>
+        </Card>
 
         <Card size="small" className="status-block file-tree-card">
           <div className="file-tree-header">
@@ -1301,97 +1352,6 @@ export default function App() {
           </div>
         </Card>
 
-        <Card size="small" className="status-block trace-card">
-          <div className="task-history-header">
-            <Text strong>编辑轨迹</Text>
-            <Space size="small">
-              <Button
-                size="small"
-                onClick={() => void refreshTraceEvents(traceQuery)}
-                disabled={!bridgeReady || traceLoading}
-              >
-                刷新
-              </Button>
-              <Button
-                size="small"
-                onClick={() => void handleExportTraceEvents()}
-                disabled={!bridgeReady || traceEvents.length === 0}
-              >
-                导出
-              </Button>
-              <Button
-                size="small"
-                onClick={() => void handleClearTraceEvents()}
-                disabled={!bridgeReady || traceEvents.length === 0}
-              >
-                清空
-              </Button>
-            </Space>
-          </div>
-          {traceSummary && (
-            <div className="trace-summary">
-              <span>总计 {traceSummary.total}</span>
-              <span>成功 {traceSummary.ok}</span>
-              <span>失败 {traceSummary.failed}</span>
-            </div>
-          )}
-          <Input
-            size="small"
-            value={traceFilterPath}
-            onChange={(event) => setTraceFilterPath(event.target.value)}
-            placeholder="按文件路径筛选轨迹"
-          />
-          <Select
-            size="small"
-            value={traceStatusFilter}
-            onChange={(value) => setTraceStatusFilter(value as "all" | "ok" | "failed")}
-            options={[
-              { label: "全部状态", value: "all" },
-              { label: "仅成功", value: "ok" },
-              { label: "仅失败", value: "failed" },
-            ]}
-          />
-          <Select
-            mode="multiple"
-            size="small"
-            value={traceOperationFilter}
-            onChange={(value) => setTraceOperationFilter(value as TraceOperation[])}
-            options={TRACE_OPERATION_OPTIONS}
-            placeholder="筛选操作类型"
-            maxTagCount="responsive"
-          />
-          <div className="trace-list">
-            {traceLoading ? (
-              <Text className="task-output-empty">加载中...</Text>
-            ) : traceEvents.length === 0 ? (
-              <Text className="task-output-empty">暂无编辑事件</Text>
-            ) : (
-              traceEvents.map((event) => (
-                <button
-                  key={event.id}
-                  type="button"
-                  className={`trace-item ${traceDetail?.id === event.id ? "active" : ""}`}
-                  onClick={() => void handleSelectTraceEvent(event.id)}
-                >
-                  <div className="trace-item-top">
-                    <span className="trace-op">{TRACE_OPERATION_LABEL[event.operation]}</span>
-                    <span className={`trace-status ${event.status}`}>{event.status === "ok" ? "成功" : "失败"}</span>
-                  </div>
-                  <div className="trace-path" title={event.targetPath}>{event.targetPath}</div>
-                  <div className="trace-meta">
-                    <span>{formatTraceTime(event.timestamp)}</span>
-                    {event.diff && (
-                      <span>
-                        +{event.diff.added} -{event.diff.removed} ~{event.diff.changed}
-                      </span>
-                    )}
-                  </div>
-                </button>
-              ))
-            )}
-          </div>
-        </Card>
-
         {taskSummary && (
           <Card size="small" className="status-block task-result-block">
             <Text strong>最近任务结果:</Text>
@@ -1413,37 +1373,135 @@ export default function App() {
           </Card>
         )}
 
-        <Card size="small" className="status-block task-history-block">
-          <div className="task-history-header">
-            <Text strong>任务历史</Text>
-            <Button
-              size="small"
-              className="task-clear-btn"
-              onClick={clearTaskHistory}
-              disabled={taskHistory.length === 0}
-            >
-              清空
-            </Button>
-          </div>
-          <div className="task-history-list">
-            {taskHistory.length === 0 ? (
-              <Text className="task-output-empty">暂无任务记录</Text>
-            ) : (
-              taskHistory.map((item) => (
-                <div className="task-history-item" key={item.id}>
-                  <div className="task-history-top">
-                    <span className="task-history-type">{TASK_META[item.taskType].label}</span>
-                    <span className={`task-history-status ${item.status}`}>
-                      {item.status === "running" ? "运行中" : item.status === "success" ? "成功" : "失败"}
-                    </span>
-                  </div>
-                  <div className="task-history-input">{item.inputText || "(空输入)"}</div>
-                  {item.error ? <div className="task-history-error">{item.error}</div> : null}
-                </div>
-              ))
+        <details className="sidebar-advanced-block">
+          <summary>高级功能：编辑轨迹</summary>
+          <Card size="small" className="status-block trace-card">
+            <div className="task-history-header">
+              <Text strong>编辑轨迹</Text>
+              <Space size="small">
+                <Button
+                  size="small"
+                  onClick={() => void refreshTraceEvents(traceQuery)}
+                  disabled={!bridgeReady || traceLoading}
+                >
+                  刷新
+                </Button>
+                <Button
+                  size="small"
+                  onClick={() => void handleExportTraceEvents()}
+                  disabled={!bridgeReady || traceEvents.length === 0}
+                >
+                  导出
+                </Button>
+                <Button
+                  size="small"
+                  onClick={() => void handleClearTraceEvents()}
+                  disabled={!bridgeReady || traceEvents.length === 0}
+                >
+                  清空
+                </Button>
+              </Space>
+            </div>
+            {traceSummary && (
+              <div className="trace-summary">
+                <span>总计 {traceSummary.total}</span>
+                <span>成功 {traceSummary.ok}</span>
+                <span>失败 {traceSummary.failed}</span>
+              </div>
             )}
-          </div>
-        </Card>
+            <Input
+              size="small"
+              value={traceFilterPath}
+              onChange={(event) => setTraceFilterPath(event.target.value)}
+              placeholder="按文件路径筛选轨迹"
+            />
+            <Select
+              size="small"
+              value={traceStatusFilter}
+              onChange={(value) => setTraceStatusFilter(value as "all" | "ok" | "failed")}
+              options={[
+                { label: "全部状态", value: "all" },
+                { label: "仅成功", value: "ok" },
+                { label: "仅失败", value: "failed" },
+              ]}
+            />
+            <Select
+              mode="multiple"
+              size="small"
+              value={traceOperationFilter}
+              onChange={(value) => setTraceOperationFilter(value as TraceOperation[])}
+              options={TRACE_OPERATION_OPTIONS}
+              placeholder="筛选操作类型"
+              maxTagCount="responsive"
+            />
+            <div className="trace-list">
+              {traceLoading ? (
+                <Text className="task-output-empty">加载中...</Text>
+              ) : traceEvents.length === 0 ? (
+                <Text className="task-output-empty">暂无编辑事件</Text>
+              ) : (
+                traceEvents.map((event) => (
+                  <button
+                    key={event.id}
+                    type="button"
+                    className={`trace-item ${traceDetail?.id === event.id ? "active" : ""}`}
+                    onClick={() => void handleSelectTraceEvent(event.id)}
+                  >
+                    <div className="trace-item-top">
+                      <span className="trace-op">{TRACE_OPERATION_LABEL[event.operation]}</span>
+                      <span className={`trace-status ${event.status}`}>{event.status === "ok" ? "成功" : "失败"}</span>
+                    </div>
+                    <div className="trace-path" title={event.targetPath}>{event.targetPath}</div>
+                    <div className="trace-meta">
+                      <span>{formatTraceTime(event.timestamp)}</span>
+                      {event.diff && (
+                        <span>
+                          +{event.diff.added} -{event.diff.removed} ~{event.diff.changed}
+                        </span>
+                      )}
+                    </div>
+                  </button>
+                ))
+              )}
+            </div>
+          </Card>
+        </details>
+
+        <details className="sidebar-advanced-block">
+          <summary>高级功能：任务历史</summary>
+          <Card size="small" className="status-block task-history-block">
+            <div className="task-history-header">
+              <Text strong>任务历史</Text>
+              <Button
+                size="small"
+                className="task-clear-btn"
+                onClick={clearTaskHistory}
+                disabled={taskHistory.length === 0}
+              >
+                清空
+              </Button>
+            </div>
+            <div className="task-history-list">
+              {taskHistory.length === 0 ? (
+                <Text className="task-output-empty">暂无任务记录</Text>
+              ) : (
+                taskHistory.map((item) => (
+                  <div className="task-history-item" key={item.id}>
+                    <div className="task-history-top">
+                      <span className="task-history-type">{TASK_META[item.taskType].label}</span>
+                      <span className={`task-history-status ${item.status}`}>
+                        {item.status === "running" ? "运行中" : item.status === "success" ? "成功" : "失败"}
+                      </span>
+                    </div>
+                    <div className="task-history-input">{item.inputText || "(空输入)"}</div>
+                    {item.error ? <div className="task-history-error">{item.error}</div> : null}
+                  </div>
+                ))
+              )}
+            </div>
+          </Card>
+        </details>
+
         {error && <Alert type="error" message={`错误: ${error}`} />}
 
         <div
@@ -1522,21 +1580,12 @@ export default function App() {
                 }}
               />
               <div className="chat-header">
-                <Title level={4}>对话</Title>
-                <Select
-                  value={selectedTask}
-                  onChange={(value) => setSelectedTask(value as TaskType)}
-                  disabled={chatLoading || !bridgeReady}
-                  options={[
-                    { value: "qa", label: TASK_META.qa.label },
-                    { value: "reimburse", label: TASK_META.reimburse.label },
-                    { value: "final_account", label: TASK_META.final_account.label },
-                    { value: "budget", label: TASK_META.budget.label },
-                  ]}
-                />
-                <Button onClick={() => setInputText(getTaskDemoPrompt(selectedTask))} disabled={chatLoading || !bridgeReady}>
-                  填入示例
-                </Button>
+                <div className="chat-header-main">
+                  <Title level={4}>对话执行区</Title>
+                  <Text className="chat-header-subtitle">
+                    当前任务：{TASK_META[selectedTask].label}
+                  </Text>
+                </div>
               </div>
 
               <div className="chat-messages-container">

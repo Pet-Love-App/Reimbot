@@ -89,7 +89,7 @@ from agent.tools.extraction_tools import (
     parse_activity,
 )
 from agent.tools.input_tools import classify_files, scan_inputs
-from agent.tools.qa_tools import answer_generate, question_understand
+from agent.tools.qa_tools import answer_generate, build_workflow_hint, question_understand
 from agent.tools.rule_tools import check_rules, rag_retrieve, rule_retrieve
 from agent.tools.stats_tools import (
     aggregate_records,
@@ -103,8 +103,9 @@ from agent.tools.stats_tools import (
 from agent.tools.storage_tools import load_records, save_record
 from agent.graphs.subgraphs.budget import route_after_load_final_data
 from agent.graphs.subgraphs.final_account import route_after_data_clean, route_after_load_records
-from agent.graphs.subgraphs.qa import route_after_understand
+from agent.graphs.subgraphs.qa import route_after_understand, rule_retrieve_node
 from agent.graphs.subgraphs.reimburse import route_after_extract, route_after_rule_check, route_after_scan
+from agent.kb.ingest import _infer_category
 from agent import EventBus, TaskDispatcher
 
 
@@ -262,6 +263,52 @@ class TestRuleQATools(unittest.TestCase):
         self.assertTrue(ans_res.success)
         self.assertIn("条款A", ans_res.data["answer"])
 
+    def test_answer_generate_low_confidence_needs_clarification(self) -> None:
+        ans_res = answer_generate(
+            "报销怎么填",
+            [{"title": "弱相关条款", "source": "kb", "score": 0.21}],
+            min_score=0.55,
+            intent="policy",
+        )
+        self.assertTrue(ans_res.success)
+        self.assertTrue(ans_res.data.get("needs_clarification"))
+        self.assertTrue(bool(ans_res.data.get("clarifying_question")))
+
+    def test_answer_generate_contains_category_hint(self) -> None:
+        ans_res = answer_generate(
+            "海外实践报销需要什么材料",
+            [
+                {
+                    "title": "海外实践报销细则",
+                    "source": "海外实践/未央书院 国际差旅财务报销培训（终版）V7.pptx",
+                    "score": 0.92,
+                    "category": "海外实践",
+                    "doc_type": "pptx",
+                }
+            ],
+            min_score=0.55,
+            intent="policy",
+        )
+        self.assertTrue(ans_res.success)
+        self.assertIn("海外实践", ans_res.data["answer"])
+        self.assertEqual(ans_res.data["citations"][0]["category"], "海外实践")
+
+    def test_build_workflow_hint(self) -> None:
+        finance_hint = build_workflow_hint("帮我处理财务报销并自动填表")
+        self.assertIsNotNone(finance_hint)
+        self.assertEqual(finance_hint.get("name"), "finance_workflow")
+        self.assertGreaterEqual(len(finance_hint.get("steps", [])), 3)
+
+
+class TestKBIngestHelpers(unittest.TestCase):
+    def test_infer_category(self) -> None:
+        cat, sub = _infer_category("海外实践/合同补充协议模板.docx")
+        self.assertEqual(cat, "海外实践")
+        self.assertEqual(sub, "")
+        cat2, sub2 = _infer_category("政策文件/2026/未央书院学生活动经费管理细则.pdf")
+        self.assertEqual(cat2, "政策文件")
+        self.assertEqual(sub2, "2026")
+
 
 class TestDocStorageStatsTools(unittest.TestCase):
     def test_doc_tools(self) -> None:
@@ -370,6 +417,29 @@ class TestOtherSubgraphRouting(unittest.TestCase):
             route_after_understand({"payload": {"normalized_query": "  ", "graph_policy": {"qa_allow_empty_query": True}}}),
             "RuleRetrieveNode",
         )
+
+    def test_rule_retrieve_node_appends_clarification_to_answer(self) -> None:
+        with patch("agent.graphs.subgraphs.qa.rule_retrieve") as mock_rule_retrieve, patch(
+            "agent.graphs.subgraphs.qa.answer_generate"
+        ) as mock_answer_generate, patch("agent.graphs.subgraphs.qa.build_workflow_hint") as mock_workflow_hint:
+            mock_rule_retrieve.return_value.data = {"items": []}
+            mock_rule_retrieve.return_value.error = None
+            mock_answer_generate.return_value.data = {
+                "answer": "证据不足，暂不下结论。",
+                "citations": [],
+                "confidence": 0.2,
+                "needs_clarification": True,
+                "clarifying_question": "活动类型、票据类型、金额区间分别是什么？",
+            }
+            mock_answer_generate.return_value.error = None
+            mock_workflow_hint.return_value = None
+
+            state = {"payload": {"normalized_query": "报销怎么做"}, "errors": [], "task_progress": []}
+            out = rule_retrieve_node(state)
+            answer = out.get("result", {}).get("answer", "")
+            self.assertIn("证据不足", answer)
+            self.assertIn("请补充", answer)
+            self.assertTrue(out.get("result", {}).get("needs_clarification"))
 
     def test_route_after_load_records(self) -> None:
         self.assertEqual(route_after_load_records({"records": [{"id": 1}]}), "DataCleanNode")

@@ -12,7 +12,7 @@ from agent.tools.extraction_tools import (
     parse_activity,
 )
 from agent.tools.input_tools import classify_files, scan_inputs
-from agent.tools.qa_tools import answer_generate, question_understand
+from agent.tools.qa_tools import answer_generate, build_workflow_hint, question_understand
 from agent.tools.rule_tools import check_rules, rag_retrieve, rule_retrieve
 from agent.tools.stats_tools import (
     aggregate_records,
@@ -51,4 +51,5 @@ __all__ = [
     "generate_report",
     "question_understand",
     "answer_generate",
+    "build_workflow_hint",
 ]

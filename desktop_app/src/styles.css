@@ -537,7 +537,31 @@ body[data-theme="dark"] .app-layout {
   z-index: 10;
   box-shadow: var(--shadow-sm);
   min-width: 236px;
-  overflow: hidden;
+  overflow-y: auto;
+  overflow-x: hidden;
+  overscroll-behavior: contain;
+  scrollbar-width: none;
+}
+
+.sidebar::-webkit-scrollbar {
+  width: 0;
+  height: 0;
+}
+
+.sidebar-title-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.sidebar-header {
+  position: sticky;
+  top: -18px;
+  z-index: 12;
+  padding-top: 18px;
+  padding-bottom: 10px;
+  background: linear-gradient(180deg, color-mix(in srgb, var(--surface) 94%, transparent), transparent);
 }
 
 .sidebar-header .ant-typography-title {
@@ -551,6 +575,147 @@ body[data-theme="dark"] .app-layout {
   font-size: 13px;
   color: var(--text-muted);
   line-height: 1.6;
+}
+
+.sidebar-steps {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 6px;
+  width: 100%;
+}
+
+.sidebar-step {
+  font-size: 11px;
+  line-height: 1.2;
+  text-align: center;
+  padding: 4px 6px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  color: var(--text-muted);
+  background: color-mix(in srgb, var(--surface-alt) 90%, transparent);
+}
+
+.sidebar-step.is-active {
+  color: var(--primary);
+  border-color: color-mix(in srgb, var(--primary) 35%, var(--border));
+  background: color-mix(in srgb, var(--primary) 12%, var(--surface));
+}
+
+.ready-pill {
+  border-radius: 999px;
+  padding: 2px 8px;
+  font-size: 11px;
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.ready-pill.is-ready {
+  color: #166534;
+  background: #dcfce7;
+}
+
+.ready-pill.is-warn {
+  color: #92400e;
+  background: #fef3c7;
+}
+
+.primary-action-btn {
+  width: 100%;
+  height: 38px;
+  border-radius: 10px;
+  font-weight: 600;
+}
+
+.sidebar-quick-actions {
+  width: 100%;
+  display: grid !important;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 8px !important;
+}
+
+.sidebar-quick-actions .ant-btn {
+  width: 100%;
+  min-width: 0;
+  padding-left: 8px;
+  padding-right: 8px;
+}
+
+.task-focus-card .ant-card-body {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.task-focus-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.task-focus-header .ant-select {
+  flex: 1;
+  max-width: 170px;
+}
+
+.task-focus-hint {
+  font-size: 12px;
+  color: var(--text-muted);
+  line-height: 1.5;
+}
+
+.sidebar-advanced-block {
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: color-mix(in srgb, var(--surface-alt) 92%, var(--surface));
+}
+
+.sidebar-advanced-block > summary {
+  cursor: pointer;
+  list-style: none;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-main);
+  padding: 10px 12px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.sidebar-advanced-block > summary::-webkit-details-marker {
+  display: none;
+}
+
+.sidebar-advanced-block > summary::after {
+  content: "⌄";
+  color: var(--text-muted);
+  font-size: 12px;
+  transform: translateY(-1px);
+}
+
+.sidebar-advanced-block[open] > summary::after {
+  content: "⌃";
+}
+
+.sidebar-advanced-block > .status-block {
+  border: none;
+  box-shadow: none;
+  margin-top: 0;
+  background: transparent;
+}
+
+.sidebar-advanced-block > .status-block .ant-card-body {
+  padding-top: 2px;
+}
+
+body[data-theme="dark"] .ready-pill.is-ready {
+  color: #bbf7d0;
+  background: rgba(34, 197, 94, 0.2);
+}
+
+body[data-theme="dark"] .ready-pill.is-warn {
+  color: #fde68a;
+  background: rgba(245, 158, 11, 0.2);
 }
 
 
@@ -946,17 +1111,28 @@ body[data-theme="dark"] .content {
   padding: 16px 20px;
   border-bottom: 1px solid var(--border);
   display: flex;
-  justify-content: space-between;
+  justify-content: flex-start;
   align-items: center;
   background: linear-gradient(105deg, color-mix(in srgb, var(--primary) 8%, var(--surface)), color-mix(in srgb, var(--accent) 10%, var(--surface)));
   gap: 10px;
   flex-wrap: wrap;
 }
 
+.chat-header-main {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
 .chat-header .ant-typography-title {
   font-size: 18px;
   font-weight: 600;
   margin: 0;
+}
+
+.chat-header-subtitle {
+  font-size: 12px;
+  color: var(--text-muted);
 }
 
 

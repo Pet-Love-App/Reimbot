@@ -740,6 +740,43 @@ def _extract_json_block(text: str) -> Optional[Dict[str, Any]]:
     return None
 
 
+def _extract_workspace_plan(text: str) -> Optional[Dict[str, Any]]:
+    raw = str(text or "").strip()
+    if not raw:
+        return None
+
+    parsed = _extract_json_block(raw)
+    if isinstance(parsed, dict):
+        return parsed
+
+    fence_match = re.search(r"```(?:json)?\s*([\s\S]*?)```", raw, flags=re.IGNORECASE)
+    if fence_match:
+        fenced = str(fence_match.group(1) or "").strip()
+        parsed = _extract_json_block(fenced)
+        if isinstance(parsed, dict):
+            return parsed
+        raw = fenced
+
+    reply_match = re.search(r"[\"']reply[\"']\s*:\s*\"([\s\S]*?)\"", raw, flags=re.IGNORECASE)
+    if not reply_match:
+        return None
+
+    reply_raw = str(reply_match.group(1) or "")
+    reply_text = (
+        reply_raw.replace(r"\r\n", "\n")
+        .replace(r"\n", "\n")
+        .replace(r"\t", "\t")
+        .replace(r"\"", '"')
+        .replace(r"\\/", "/")
+        .replace(r"\\", "\\")
+        .strip()
+    )
+    if not reply_text:
+        return None
+
+    return {"reply": reply_text, "actions": []}
+
+
 def _workspace_execute_actions(root: Path, actions: List[Dict[str, Any]]) -> List[str]:
     logs: List[str] = []
     for item in actions[:12]:
@@ -1031,11 +1068,14 @@ def _run_workspace_agent(
         ).strip()
 
         planner_raw = _llm_chat(message=planner_prompt, history=[], kb_context="")
-        parsed = _extract_json_block(planner_raw)
+        parsed = _extract_workspace_plan(planner_raw)
         if parsed is None:
+            fallback = str(planner_raw or "").strip()
+            if fallback.startswith("{") and "reply" in fallback and "actions" in fallback:
+                fallback = "我没有拿到可执行计划。请提供要编辑的相对路径和具体修改内容。"
             return {
                 "ok": True,
-                "reply": planner_raw,
+                "reply": fallback or "我没有拿到可执行计划。请重试或补充更明确的修改目标。",
                 "mode": "workspace",
             }
 
@@ -1275,12 +1315,15 @@ def _get_kb_context(message: str) -> str:
         return ""
 
     try:
-        from agent.kb.retriever import format_retrieved_context, retrieve_chunks  # noqa: WPS433
+        from agent.kb.retriever import format_retrieved_context, retrieve_chunks, search_policy  # noqa: WPS433
     except ModuleNotFoundError:
         return ""
 
     try:
-        chunks = retrieve_chunks(message, kb_path=kb_path, top_k=top_k)
+        # Prefer hybrid semantic retrieval; fallback to keyword retrieval for robustness.
+        chunks = search_policy(message, top_k=top_k, kb_path=kb_path)
+        if not chunks:
+            chunks = retrieve_chunks(message, kb_path=kb_path, top_k=top_k)
         return format_retrieved_context(chunks, max_chars=max_chars)
     except Exception:
         return ""

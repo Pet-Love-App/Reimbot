@@ -349,6 +349,25 @@ python run_trulens_eval.py --dataset data/eval/qa_eval_samples.json --use-llm-ju
 - `summary` 包含样本数和平均得分
 - `records` 包含每条问题的检索上下文、引用与打分
 
+## 合成数据（SFT）
+
+可基于空白模板批量生成“指令-输入-输出”数据，用于表单填充类任务微调。
+
+1) 使用内置模板生成：
+
+```bash
+python scripts/generate_sft_synthetic_data.py --template data/eval/sft_template_form_fill.json --output data/eval/sft_synthetic_data.jsonl --count 500
+```
+
+2) 若你已配置兼容 OpenAI 的模型接口（例如智谱兼容网关），可启用 LLM 生成并自动回退规则生成：
+
+```bash
+$env:AGENT_SYNTH_API_KEY="<your_key>"
+python scripts/generate_sft_synthetic_data.py --template data/eval/sft_template_form_fill.json --use-llm --count 500
+```
+
+输出为 JSONL，每行包含 `instruction / input / output / meta` 字段。
+
 ## 贡献指南
 
 欢迎通过 `Issue` 和 `Pull Request` 参与项目改进。

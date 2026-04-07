@@ -6,6 +6,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 import zipfile
 
 
@@ -228,6 +229,46 @@ class TestAgentBridgeTaskMode(unittest.TestCase):
         self.assertTrue(any("项目A" in fact for fact in facts_a))
         self.assertFalse(any("项目B" in fact for fact in facts_a))
         self.assertTrue(any("项目B" in fact for fact in facts_b))
+
+    def test_extract_workspace_plan_with_invalid_json_windows_path(self) -> None:
+        planner_raw = (
+            '{ "reply": "请提供具体文件路径和修改内容，例如：'
+            "'E:\\Desktop\\agent\\agent.py 修改为...' 或 '这个文件/当前文件 修改为...'。",
+            ' "actions": [] }'
+        )
+
+        parsed = self.bridge._extract_workspace_plan(planner_raw)
+        self.assertIsInstance(parsed, dict)
+        self.assertIn("请提供具体文件路径和修改内容", str(parsed.get("reply", "")))
+        self.assertEqual(parsed.get("actions"), [])
+
+    def test_workspace_mode_does_not_echo_raw_json_plan(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            malformed_plan = (
+                '{ "reply": "请提供具体文件路径和修改内容，例如：'
+                "'E:\\Desktop\\agent\\agent.py 修改为...' 或 '这个文件/当前文件 修改为...'。",
+                ' "actions": [] }'
+            )
+
+            with patch.object(self.bridge, "_is_llm_enabled", return_value=True), patch.object(
+                self.bridge, "_llm_chat", return_value=malformed_plan
+            ):
+                response = self.bridge.handle_request(
+                    {
+                        "message": "你好",
+                        "payload": {
+                            "workspace_mode": True,
+                            "workspace_dir": str(root),
+                        },
+                    }
+                )
+
+            reply = str(response.get("reply", ""))
+            self.assertTrue(response.get("ok"))
+            self.assertNotIn('"actions"', reply)
+            self.assertNotIn('{', reply)
+            self.assertIn("请提供具体文件路径和修改内容", reply)
 
 
 if __name__ == "__main__":

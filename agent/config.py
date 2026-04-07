@@ -93,8 +93,8 @@ def get_graph_policy_config() -> GraphPolicyConfig:
             minimum=1,
         ),
         qa_kb_score_threshold=_safe_float(
-            os.getenv("AGENT_GRAPH_QA_KB_SCORE_THRESHOLD", "0.0"),
-            0.0,
+            os.getenv("AGENT_GRAPH_QA_KB_SCORE_THRESHOLD", "0.55"),
+            0.55,
         ),
         final_generate_when_empty=_safe_bool(
             os.getenv("AGENT_GRAPH_FINAL_GENERATE_WHEN_EMPTY", "true"),
