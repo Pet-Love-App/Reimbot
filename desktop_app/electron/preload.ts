@@ -31,6 +31,49 @@ type LlmConfig = {
   model: string;
 };
 
+type TraceOperation =
+  | "write_file"
+  | "update_excel_cell"
+  | "update_excel_range"
+  | "append_excel_rows"
+  | "trim_excel_sheet";
+
+type TraceSnapshotMeta = {
+  kind: "text" | "binary" | "missing";
+  size: number;
+  truncated: boolean;
+  hash: string;
+};
+
+type TraceDiffSummary = {
+  added: number;
+  removed: number;
+  changed: number;
+  snippets: Array<{
+    line: number;
+    before: string;
+    after: string;
+  }>;
+};
+
+type EditTraceEvent = {
+  id: string;
+  timestamp: string;
+  operation: TraceOperation;
+  targetPath: string;
+  status: "ok" | "failed";
+  error?: string;
+  meta?: Record<string, unknown>;
+  before: TraceSnapshotMeta;
+  after: TraceSnapshotMeta;
+  diff?: TraceDiffSummary;
+};
+
+type EditTraceEventDetail = EditTraceEvent & {
+  beforeContent?: string;
+  afterContent?: string;
+};
+
 const api = {
   openTemplate: async (): Promise<string | null> => ipcRenderer.invoke("template:open"),
   getPredefinedTemplate: async (type: string): Promise<string> => ipcRenderer.invoke("template:exportPredefined", type),
@@ -45,6 +88,70 @@ const api = {
   ): Promise<{ ok: boolean; entries?: Array<{ name: string; path: string; isDir: boolean }>; error?: string }> =>
     ipcRenderer.invoke("template:listDir", dirPath),
   readFile: async (targetPath: string): Promise<unknown> => ipcRenderer.invoke("template:readFile", targetPath),
+  writeFile: async (
+    targetPath: string,
+    content: string
+  ): Promise<{ ok: boolean; filePath?: string; updatedAt?: string; error?: string }> =>
+    ipcRenderer.invoke("template:writeFile", { targetPath, content }),
+  updateExcelCell: async (
+    targetPath: string,
+    sheetName: string,
+    rowIndex: number,
+    colIndex: number,
+    value: string
+  ): Promise<{ ok: boolean; updatedAt?: string; error?: string }> =>
+    ipcRenderer.invoke("template:updateExcelCell", {
+      targetPath,
+      sheetName,
+      rowIndex,
+      colIndex,
+      value,
+    }),
+  updateExcelRange: async (
+    targetPath: string,
+    sheetName: string,
+    startRowIndex: number,
+    startColIndex: number,
+    values: string[][]
+  ): Promise<{ ok: boolean; updatedAt?: string; error?: string }> =>
+    ipcRenderer.invoke("template:updateExcelRange", {
+      targetPath,
+      sheetName,
+      startRowIndex,
+      startColIndex,
+      values,
+    }),
+  appendExcelRows: async (
+    targetPath: string,
+    sheetName: string,
+    count: number
+  ): Promise<{ ok: boolean; updatedAt?: string; error?: string }> =>
+    ipcRenderer.invoke("template:appendExcelRows", {
+      targetPath,
+      sheetName,
+      count,
+    }),
+  trimExcelSheet: async (
+    targetPath: string,
+    sheetName: string,
+    axis: "row" | "col",
+    count: number
+  ): Promise<{ ok: boolean; updatedAt?: string; error?: string }> =>
+    ipcRenderer.invoke("template:trimExcelSheet", {
+      targetPath,
+      sheetName,
+      axis,
+      count,
+    }),
+  listEditTrace: async (targetPath?: string): Promise<EditTraceEvent[]> =>
+    ipcRenderer.invoke("trace:list", targetPath),
+  getEditTrace: async (eventId: string): Promise<EditTraceEventDetail | null> =>
+    ipcRenderer.invoke("trace:get", eventId),
+  replayEditTrace: async (
+    eventId: string
+  ): Promise<{ ok: boolean; targetPath?: string; content?: string; timestamp?: string; error?: string }> =>
+    ipcRenderer.invoke("trace:replay", eventId),
+  clearEditTrace: async (): Promise<{ ok: boolean }> => ipcRenderer.invoke("trace:clear"),
   getPreview: async (filePath: string): Promise<TemplatePreview> =>
     ipcRenderer.invoke("template:preview", filePath),
   subscribePreviewUpdate: (handler: (payload: TemplatePreview) => void): Unsubscribe => {

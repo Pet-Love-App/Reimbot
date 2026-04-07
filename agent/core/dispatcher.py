@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import uuid
 from typing import Any, Dict, Optional
 
 from agent.config import get_graph_policy_defaults
@@ -27,8 +28,10 @@ class TaskDispatcher:
             self.graph = build_main_graph()
 
     def dispatch(self, task_type: str, payload: Dict[str, Any]) -> Dict[str, Any]:
-        self.event_bus.publish("task_start", {"task_type": task_type})
+        trace_id = str(uuid.uuid4())
+        self.event_bus.publish("task_start", {"task_type": task_type, "trace_id": trace_id})
         merged_payload = _merge_graph_policy(payload if isinstance(payload, dict) else {})
+        merged_payload = {**merged_payload, "trace_id": trace_id}
         initial_state: AppState = {
             "task_type": task_type,
             "payload": merged_payload,
@@ -40,12 +43,14 @@ class TaskDispatcher:
         try:
             final_state = self.graph.invoke(initial_state)
             for step in final_state.get("task_progress", []):
-                self.event_bus.publish("task_progress", step)
+                self.event_bus.publish("task_progress", {**step, "trace_id": trace_id})
             result = final_state.get("result", {})
+            if isinstance(result, dict):
+                result = {**result, "trace_id": trace_id}
             if final_state.get("errors"):
                 result = {**result, "errors": final_state.get("errors", [])}
-            self.event_bus.publish("task_done", {"task_type": task_type, "result": result})
+            self.event_bus.publish("task_done", {"task_type": task_type, "result": result, "trace_id": trace_id})
             return result
         except Exception as exc:
-            self.event_bus.publish("task_error", {"task_type": task_type, "message": str(exc)})
+            self.event_bus.publish("task_error", {"task_type": task_type, "message": str(exc), "trace_id": trace_id})
             raise

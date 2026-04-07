@@ -678,6 +678,81 @@ body[data-theme="dark"] .app-layout {
   margin-top: 12px;
 }
 
+.trace-card {
+  margin-top: 12px;
+}
+
+.trace-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  max-height: 240px;
+  overflow-y: auto;
+  margin-top: 8px;
+}
+
+.trace-item {
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface-alt);
+  padding: 8px;
+  text-align: left;
+  cursor: pointer;
+  color: var(--text-main);
+}
+
+.trace-item.active {
+  border-color: var(--primary);
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--primary) 20%, transparent);
+}
+
+.trace-item-top {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.trace-op {
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.trace-status {
+  font-size: 11px;
+  border-radius: 999px;
+  padding: 2px 6px;
+}
+
+.trace-status.ok {
+  background: #dcfce7;
+  color: #166534;
+}
+
+.trace-status.failed {
+  background: #fee2e2;
+  color: #991b1b;
+}
+
+.trace-path {
+  margin-top: 6px;
+  font-size: 11px;
+  color: var(--text-muted);
+  font-family: var(--font-mono);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.trace-meta {
+  margin-top: 4px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  font-size: 11px;
+  color: var(--text-muted);
+}
+
 .task-history-list {
   display: flex;
   flex-direction: column;
@@ -1002,6 +1077,117 @@ body[data-theme="dark"] .content {
   padding-right: 2px;
 }
 
+.editor-panel {
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--surface);
+  padding: 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.trace-detail-panel {
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--surface);
+  padding: 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-bottom: 10px;
+}
+
+.trace-detail-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.trace-detail-title {
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.trace-detail-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 6px 10px;
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+.trace-diff-box {
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface-alt);
+  padding: 8px;
+}
+
+.trace-diff-summary {
+  font-size: 12px;
+  font-weight: 600;
+  margin-bottom: 6px;
+}
+
+.trace-snippet {
+  margin: 0;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  line-height: 1.6;
+  white-space: pre-wrap;
+  color: var(--text-main);
+}
+
+.editor-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-size: 12px;
+}
+
+.editor-title {
+  font-weight: 600;
+  color: var(--text-main);
+}
+
+.editor-status.saved {
+  color: #166534;
+}
+
+.editor-status.dirty {
+  color: #b45309;
+}
+
+.editor-autosave {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  color: var(--text-muted);
+  margin-left: auto;
+}
+
+.editor-textarea {
+  width: 100%;
+  min-height: 180px;
+  max-height: 320px;
+  resize: vertical;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface-alt);
+  color: var(--text-main);
+  font-family: var(--font-mono);
+  font-size: 12px;
+  line-height: 1.6;
+  padding: 10px 12px;
+}
+
+.editor-error {
+  color: #b91c1c;
+  font-size: 12px;
+}
+
 .preview-header {
   background: var(--surface);
   border-radius: var(--radius-lg);
@@ -1128,12 +1314,44 @@ body[data-theme="dark"] .content {
   gap: 8px;
 }
 
+.sheet-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
 .sheet-card h3::before {
   content: '📊';
 }
 
 .docx-card h3::before {
   content: '📄';
+}
+
+.excel-action-btn {
+  border: 1px solid var(--border);
+  background: var(--surface-alt);
+  color: var(--text-main);
+  border-radius: 8px;
+  padding: 4px 10px;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.excel-action-btn:disabled {
+  cursor: not-allowed;
+  opacity: 0.6;
+}
+
+.excel-count-input {
+  width: 72px;
+  border: 1px solid var(--border);
+  background: var(--surface);
+  color: var(--text-main);
+  border-radius: 8px;
+  padding: 4px 6px;
+  font-size: 12px;
 }
 
 .template-html-block {
@@ -1287,6 +1505,18 @@ body[data-theme="dark"] .content {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.excel-edit-input {
+  width: 100%;
+  min-width: 72px;
+  border: 1px solid var(--primary);
+  border-radius: 6px;
+  padding: 2px 6px;
+  background: var(--surface);
+  color: var(--text-main);
+  font-size: 12px;
+  font-family: var(--font-mono);
 }
 
 .markdown-content {

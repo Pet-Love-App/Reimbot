@@ -6,6 +6,7 @@ import { PreviewPanel } from "./components/PreviewPanel";
 import { MarkdownRenderer } from "./components/MarkdownRenderer";
 import type { AgentChatResponse, AgentChatStreamEvent, ChatMessage } from "./types/chat";
 import type { FilePreview } from "./types/preview";
+import type { EditTraceEvent, EditTraceEventDetail, TraceOperation } from "./types/trace";
 import { useThemeMode } from "./theme";
 
 type TaskType = "qa" | "reimburse" | "final_account" | "budget";
@@ -49,6 +50,14 @@ const TASK_META: Record<TaskType, { label: string; demo: string }> = {
   budget: { label: "预算生成", demo: "请生成下一年度预算" },
 };
 
+const TRACE_OPERATION_LABEL: Record<TraceOperation, string> = {
+  write_file: "文本写入",
+  update_excel_cell: "改单元格",
+  update_excel_range: "批量粘贴",
+  append_excel_rows: "追加行",
+  trim_excel_sheet: "删除行列",
+};
+
 export default function App() {
   const bridge = window.templateApi;
   const bridgeReady = Boolean(bridge);
@@ -71,6 +80,18 @@ export default function App() {
   const [loadingPaths, setLoadingPaths] = useState<string[]>([]);
   const [treeLoading, setTreeLoading] = useState(false);
   const treeRefreshInFlightRef = useRef(false);
+  const saveTimerRef = useRef<number | null>(null);
+
+  const [editorContent, setEditorContent] = useState("");
+  const [editorDirty, setEditorDirty] = useState(false);
+  const [editorSaving, setEditorSaving] = useState(false);
+  const [editorError, setEditorError] = useState<string | null>(null);
+  const [editorAutoSave, setEditorAutoSave] = useState(true);
+  const [editorLastSavedAt, setEditorLastSavedAt] = useState<string | null>(null);
+  const [traceEvents, setTraceEvents] = useState<EditTraceEvent[]>([]);
+  const [traceFilterPath, setTraceFilterPath] = useState("");
+  const [traceLoading, setTraceLoading] = useState(false);
+  const [traceDetail, setTraceDetail] = useState<EditTraceEventDetail | null>(null);
 
   const appRef = useRef<HTMLDivElement>(null);
   const contentRef = useRef<HTMLDivElement>(null);
@@ -176,6 +197,44 @@ export default function App() {
       bridge.unwatchTemplate().catch(() => undefined);
     };
   }, [bridge]);
+
+  useEffect(() => {
+    if (!preview || preview.kind !== "text") {
+      setEditorContent("");
+      setEditorDirty(false);
+      setEditorError(null);
+      setEditorLastSavedAt(null);
+      return;
+    }
+    setEditorContent(preview.content);
+    setEditorDirty(false);
+    setEditorError(null);
+    setEditorLastSavedAt(preview.updatedAt);
+  }, [preview]);
+
+  const refreshTraceEvents = async (filterPath?: string) => {
+    if (!bridge || typeof (bridge as any).listEditTrace !== "function") {
+      return;
+    }
+    setTraceLoading(true);
+    try {
+      const events = ((await (bridge as any).listEditTrace(filterPath)) ?? []) as EditTraceEvent[];
+      setTraceEvents(Array.isArray(events) ? events : []);
+    } finally {
+      setTraceLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    if (!bridge || typeof (bridge as any).listEditTrace !== "function") {
+      return;
+    }
+    void refreshTraceEvents();
+    const timer = window.setInterval(() => {
+      void refreshTraceEvents(traceFilterPath.trim() || undefined);
+    }, 2000);
+    return () => window.clearInterval(timer);
+  }, [bridge, traceFilterPath]);
 
   useEffect(() => {
     if (!bridge || typeof bridge.getProjectDir !== "function" || typeof bridge.listDir !== "function") {
@@ -653,6 +712,61 @@ export default function App() {
     setMessages([DEFAULT_CHAT_MESSAGE]);
   };
 
+  const formatTraceTime = (iso: string): string => {
+    return new Date(iso).toLocaleTimeString();
+  };
+
+  const formatBytes = (size: number): string => {
+    if (size < 1024) return `${size} B`;
+    if (size < 1024 * 1024) return `${(size / 1024).toFixed(1)} KB`;
+    return `${(size / (1024 * 1024)).toFixed(2)} MB`;
+  };
+
+  const handleSelectTraceEvent = async (eventId: string) => {
+    if (!bridge || typeof (bridge as any).getEditTrace !== "function") {
+      return;
+    }
+    const detail = (await (bridge as any).getEditTrace(eventId)) as EditTraceEventDetail | null;
+    setTraceDetail(detail);
+  };
+
+  const handleReplayTraceEvent = async (eventId: string) => {
+    if (!bridge || typeof (bridge as any).replayEditTrace !== "function") {
+      return;
+    }
+    const result = await (bridge as any).replayEditTrace(eventId);
+    if (!result?.ok) {
+      setError(result?.error || "回放失败");
+      return;
+    }
+    const targetPath = String(result.targetPath ?? "");
+    const replayContent = String(result.content ?? "");
+    if (!targetPath) {
+      return;
+    }
+    setCurrentFile(targetPath);
+    setPreview({
+      kind: "text",
+      filePath: targetPath,
+      fileType: targetPath.split(".").pop() || "txt",
+      updatedAt: String(result.timestamp || new Date().toISOString()),
+      content: replayContent,
+      truncated: false,
+    });
+    setEditorContent(replayContent);
+    setEditorDirty(false);
+    setEditorError(null);
+  };
+
+  const handleClearTraceEvents = async () => {
+    if (!bridge || typeof (bridge as any).clearEditTrace !== "function") {
+      return;
+    }
+    await (bridge as any).clearEditTrace();
+    setTraceDetail(null);
+    setTraceEvents([]);
+  };
+
   const buildFriendlyError = (input: unknown): { short: string; detail: string } => {
     const raw = String(input ?? "未知错误").trim() || "未知错误";
     const lower = raw.toLowerCase();
@@ -905,6 +1019,123 @@ export default function App() {
     }
   };
 
+  const persistEditedFile = async (nextContent: string) => {
+    if (!bridge || !currentFile || preview?.kind !== "text") return false;
+    if (editorSaving) return false;
+    setEditorSaving(true);
+    setEditorError(null);
+    try {
+      const writeResult = await bridge.writeFile(currentFile, nextContent);
+      if (!writeResult?.ok) {
+        setEditorError(writeResult?.error || "保存失败");
+        return false;
+      }
+      setEditorDirty(false);
+      setEditorLastSavedAt(writeResult.updatedAt || new Date().toISOString());
+      setPreview((prev) => {
+        if (!prev || prev.kind !== "text") return prev;
+        return {
+          ...prev,
+          content: nextContent,
+          updatedAt: writeResult.updatedAt || prev.updatedAt,
+        };
+      });
+      return true;
+    } catch (err) {
+      setEditorError(err instanceof Error ? err.message : String(err));
+      return false;
+    } finally {
+      setEditorSaving(false);
+    }
+  };
+
+  const updateExcelCell = async (
+    sheetName: string,
+    rowIndex: number,
+    colIndex: number,
+    value: string
+  ) => {
+    if (!bridge || !currentFile) return;
+    const result = await bridge.updateExcelCell(currentFile, sheetName, rowIndex, colIndex, value);
+    if (!result?.ok) {
+      setError(result?.error || "更新单元格失败");
+      return;
+    }
+    const snapshot = await bridge.getPreview(currentFile);
+    setPreview({ kind: "template", data: snapshot });
+    setError(null);
+  };
+
+  const updateExcelRange = async (
+    sheetName: string,
+    startRowIndex: number,
+    startColIndex: number,
+    values: string[][]
+  ) => {
+    if (!bridge || !currentFile) return;
+    const result = await bridge.updateExcelRange(
+      currentFile,
+      sheetName,
+      startRowIndex,
+      startColIndex,
+      values
+    );
+    if (!result?.ok) {
+      setError(result?.error || "批量粘贴失败");
+      return;
+    }
+    const snapshot = await bridge.getPreview(currentFile);
+    setPreview({ kind: "template", data: snapshot });
+    setError(null);
+  };
+
+  const appendExcelRows = async (sheetName: string, count: number) => {
+    if (!bridge || !currentFile) return;
+    const result = await bridge.appendExcelRows(currentFile, sheetName, count);
+    if (!result?.ok) {
+      setError(result?.error || "追加空行失败");
+      return;
+    }
+    const snapshot = await bridge.getPreview(currentFile);
+    setPreview({ kind: "template", data: snapshot });
+    setError(null);
+  };
+
+  const trimExcelSheet = async (sheetName: string, axis: "row" | "col", count: number) => {
+    if (!bridge || !currentFile) return;
+    const result = await bridge.trimExcelSheet(currentFile, sheetName, axis, count);
+    if (!result?.ok) {
+      setError(result?.error || "结构编辑失败");
+      return;
+    }
+    const snapshot = await bridge.getPreview(currentFile);
+    setPreview({ kind: "template", data: snapshot });
+    setError(null);
+  };
+
+  useEffect(() => {
+    if (!editorAutoSave || !editorDirty || preview?.kind !== "text") {
+      if (saveTimerRef.current !== null) {
+        window.clearTimeout(saveTimerRef.current);
+        saveTimerRef.current = null;
+      }
+      return;
+    }
+    if (saveTimerRef.current !== null) {
+      window.clearTimeout(saveTimerRef.current);
+    }
+    saveTimerRef.current = window.setTimeout(() => {
+      void persistEditedFile(editorContent);
+    }, 600);
+
+    return () => {
+      if (saveTimerRef.current !== null) {
+        window.clearTimeout(saveTimerRef.current);
+        saveTimerRef.current = null;
+      }
+    };
+  }, [editorAutoSave, editorDirty, editorContent, preview?.kind, currentFile]);
+
   const handlePreviewFile = async (filePath: string) => {
     if (!bridge) return;
     const lower = filePath.toLowerCase();
@@ -942,6 +1173,10 @@ export default function App() {
           content: response.content || "",
           truncated: response.truncated,
         });
+        setEditorContent(response.content || "");
+        setEditorDirty(false);
+        setEditorError(null);
+        setEditorLastSavedAt(response.updatedAt || new Date().toISOString());
       } else if (response.kind === "image") {
         setPreview({
           kind: "image",
@@ -1006,6 +1241,64 @@ export default function App() {
               <Text className="task-output-empty">暂无文件</Text>
             ) : (
               renderTreeNodes(treeNodes)
+            )}
+          </div>
+        </Card>
+
+        <Card size="small" className="status-block trace-card">
+          <div className="task-history-header">
+            <Text strong>编辑轨迹</Text>
+            <Space size="small">
+              <Button
+                size="small"
+                onClick={() => void refreshTraceEvents(traceFilterPath.trim() || undefined)}
+                disabled={!bridgeReady || traceLoading}
+              >
+                刷新
+              </Button>
+              <Button
+                size="small"
+                onClick={() => void handleClearTraceEvents()}
+                disabled={!bridgeReady || traceEvents.length === 0}
+              >
+                清空
+              </Button>
+            </Space>
+          </div>
+          <Input
+            size="small"
+            value={traceFilterPath}
+            onChange={(event) => setTraceFilterPath(event.target.value)}
+            placeholder="按文件路径筛选轨迹"
+          />
+          <div className="trace-list">
+            {traceLoading ? (
+              <Text className="task-output-empty">加载中...</Text>
+            ) : traceEvents.length === 0 ? (
+              <Text className="task-output-empty">暂无编辑事件</Text>
+            ) : (
+              traceEvents.map((event) => (
+                <button
+                  key={event.id}
+                  type="button"
+                  className={`trace-item ${traceDetail?.id === event.id ? "active" : ""}`}
+                  onClick={() => void handleSelectTraceEvent(event.id)}
+                >
+                  <div className="trace-item-top">
+                    <span className="trace-op">{TRACE_OPERATION_LABEL[event.operation]}</span>
+                    <span className={`trace-status ${event.status}`}>{event.status === "ok" ? "成功" : "失败"}</span>
+                  </div>
+                  <div className="trace-path" title={event.targetPath}>{event.targetPath}</div>
+                  <div className="trace-meta">
+                    <span>{formatTraceTime(event.timestamp)}</span>
+                    {event.diff && (
+                      <span>
+                        +{event.diff.added} -{event.diff.removed} ~{event.diff.changed}
+                      </span>
+                    )}
+                  </div>
+                </button>
+              ))
             )}
           </div>
         </Card>
@@ -1239,7 +1532,101 @@ export default function App() {
               setChatPanePercent((prev) => Math.max(20, Math.min(80, prev + delta)));
             }}
           />
-          <PreviewPanel preview={preview} />
+          {traceDetail && (
+            <section className="trace-detail-panel">
+              <div className="trace-detail-header">
+                <span className="trace-detail-title">编辑回放</span>
+                <Space size="small">
+                  <Button size="small" onClick={() => void handleReplayTraceEvent(traceDetail.id)}>
+                    回放到该步
+                  </Button>
+                  <Button size="small" onClick={() => setTraceDetail(null)}>
+                    收起
+                  </Button>
+                </Space>
+              </div>
+              <div className="trace-detail-grid">
+                <div>类型: {TRACE_OPERATION_LABEL[traceDetail.operation]}</div>
+                <div>时间: {new Date(traceDetail.timestamp).toLocaleString()}</div>
+                <div>状态: {traceDetail.status === "ok" ? "成功" : "失败"}</div>
+                <div>目标: {traceDetail.targetPath}</div>
+                <div>变更前: {traceDetail.before.kind} / {formatBytes(traceDetail.before.size)}</div>
+                <div>变更后: {traceDetail.after.kind} / {formatBytes(traceDetail.after.size)}</div>
+              </div>
+              {traceDetail.diff && (
+                <div className="trace-diff-box">
+                  <div className="trace-diff-summary">
+                    +{traceDetail.diff.added} -{traceDetail.diff.removed} ~{traceDetail.diff.changed}
+                  </div>
+                  <pre className="trace-snippet">
+                    {traceDetail.diff.snippets
+                      .map((snippet) => `L${snippet.line}\n- ${snippet.before}\n+ ${snippet.after}`)
+                      .join("\n\n")}
+                  </pre>
+                </div>
+              )}
+            </section>
+          )}
+          {preview?.kind === "text" && (
+            <section className="editor-panel">
+              <div className="editor-toolbar">
+                <span className="editor-title">可视化编辑</span>
+                <span className={`editor-status ${editorDirty ? "dirty" : "saved"}`}>
+                  {editorSaving
+                    ? "保存中..."
+                    : editorDirty
+                      ? "未保存"
+                      : editorLastSavedAt
+                        ? `已保存 ${new Date(editorLastSavedAt).toLocaleTimeString()}`
+                        : "已保存"}
+                </span>
+                <label className="editor-autosave">
+                  <input
+                    type="checkbox"
+                    checked={editorAutoSave}
+                    onChange={(event) => setEditorAutoSave(event.target.checked)}
+                  />
+                  自动保存
+                </label>
+                <Button
+                  size="small"
+                  type="primary"
+                  onClick={() => void persistEditedFile(editorContent)}
+                  disabled={editorSaving || !editorDirty}
+                >
+                  保存
+                </Button>
+              </div>
+              <textarea
+                className="editor-textarea"
+                value={editorContent}
+                onChange={(event) => {
+                  const next = event.target.value;
+                  setEditorContent(next);
+                  setEditorDirty(true);
+                  setPreview((prev) => {
+                    if (!prev || prev.kind !== "text") return prev;
+                    return { ...prev, content: next };
+                  });
+                }}
+                onKeyDown={(event) => {
+                  if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "s") {
+                    event.preventDefault();
+                    void persistEditedFile(editorContent);
+                  }
+                }}
+                spellCheck={false}
+              />
+              {editorError && <div className="editor-error">{editorError}</div>}
+            </section>
+          )}
+          <PreviewPanel
+            preview={preview}
+            onExcelCellChange={updateExcelCell}
+            onExcelRangeChange={updateExcelRange}
+            onExcelAppendRows={appendExcelRows}
+            onExcelTrimSheet={trimExcelSheet}
+          />
         </div>
       </main>
     </div>

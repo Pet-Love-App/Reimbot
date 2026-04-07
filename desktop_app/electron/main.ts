@@ -8,7 +8,9 @@ import chokidar, { type FSWatcher } from "chokidar";
 import dotenv from "dotenv";
 import { app, BrowserWindow, dialog, ipcMain, screen, shell } from "electron";
 import type { OpenDialogOptions } from "electron";
+import * as XLSX from "xlsx";
 
+import { EditTraceStore } from "./editTrace";
 import { parseTemplate } from "./templateParser";
 
 dotenv.config({ path: path.join(process.cwd(), ".env") });
@@ -32,6 +34,7 @@ let activeChatSessionId: string | null = null;
 let watcher: FSWatcher | null = null;
 let currentFilePath: string | null = null;
 const activeChatProcesses = new Map<string, ReturnType<typeof spawn>>();
+const editTraceStore = new EditTraceStore();
 let isQuitting = false;
 let petWorkspaceDir: string | null = null;
 let petDragState: { startMouseX: number; startMouseY: number; startWindowX: number; startWindowY: number } | null = null;
@@ -724,6 +727,21 @@ function normalizeWorkspaceDir(candidatePath: string): string | null {
   }
 }
 
+function normalizeExcelCellValue(raw: string): string | number | boolean {
+  const text = String(raw ?? "");
+  const trimmed = text.trim();
+  if (trimmed === "") {
+    return "";
+  }
+  if (/^(true|false)$/i.test(trimmed)) {
+    return trimmed.toLowerCase() === "true";
+  }
+  if (/^[+-]?(\d+(\.\d+)?|\.\d+)$/.test(trimmed)) {
+    return Number(trimmed);
+  }
+  return text;
+}
+
 function showOrCreateMainWindow(): void {
   if (!mainWindow || mainWindow.isDestroyed()) {
     createMainWindow();
@@ -1008,6 +1026,384 @@ ipcMain.handle("template:readFile", async (_event, targetPath: string) => {
   }
 });
 
+ipcMain.handle(
+  "template:writeFile",
+  async (_event, payload: { targetPath: string; content: string }) => {
+    const filePath = String(payload?.targetPath ?? "");
+    if (!filePath) {
+      return { ok: false, error: "文件路径不能为空" };
+    }
+    if (!fs.existsSync(filePath)) {
+      return { ok: false, error: "文件不存在" };
+    }
+    try {
+      const content = String(payload?.content ?? "");
+      await editTraceStore.recordMutation({
+        operation: "write_file",
+        targetPath: filePath,
+        meta: {
+          contentLength: content.length,
+        },
+        run: () => {
+          const stat = fs.statSync(filePath);
+          if (!stat.isFile()) {
+            throw new Error("目标不是文件");
+          }
+          fs.writeFileSync(filePath, content, "utf-8");
+        },
+      });
+      const updated = fs.statSync(filePath);
+      return {
+        ok: true,
+        filePath,
+        updatedAt: updated.mtime.toISOString(),
+      };
+    } catch (err) {
+      return { ok: false, error: err instanceof Error ? err.message : String(err) };
+    }
+  }
+);
+
+ipcMain.handle(
+  "template:updateExcelCell",
+  async (
+    _event,
+    payload: {
+      targetPath: string;
+      sheetName: string;
+      rowIndex: number;
+      colIndex: number;
+      value: string;
+    }
+  ) => {
+    const filePath = String(payload?.targetPath ?? "");
+    if (!filePath) {
+      return { ok: false, error: "文件路径不能为空" };
+    }
+    if (!fs.existsSync(filePath)) {
+      return { ok: false, error: "文件不存在" };
+    }
+    const ext = path.extname(filePath).toLowerCase();
+    if (ext !== ".xlsx" && ext !== ".xls") {
+      return { ok: false, error: "仅支持编辑 xlsx/xls 文件" };
+    }
+    try {
+      await editTraceStore.recordMutation({
+        operation: "update_excel_cell",
+        targetPath: filePath,
+        meta: {
+          sheetName: payload.sheetName,
+          rowIndex: payload.rowIndex,
+          colIndex: payload.colIndex,
+        },
+        run: () => {
+          const workbook = XLSX.readFile(filePath, { cellDates: true });
+          const fallbackSheetName = workbook.SheetNames[0];
+          if (!fallbackSheetName) {
+            throw new Error("工作簿无可用工作表");
+          }
+          const sheetName = workbook.SheetNames.includes(payload.sheetName)
+            ? payload.sheetName
+            : fallbackSheetName;
+          const worksheet = workbook.Sheets[sheetName];
+          if (!worksheet) {
+            throw new Error("工作表不存在");
+          }
+
+          const rowIndex = Math.max(0, Number(payload.rowIndex) || 0);
+          const colIndex = Math.max(0, Number(payload.colIndex) || 0);
+          const cellAddress = XLSX.utils.encode_cell({ r: rowIndex, c: colIndex });
+          const nextValue = normalizeExcelCellValue(payload.value);
+
+          worksheet[cellAddress] = {
+            t: typeof nextValue === "number" ? "n" : typeof nextValue === "boolean" ? "b" : "s",
+            v: nextValue as XLSX.CellObject["v"],
+          };
+
+          const existingRef = String(worksheet["!ref"] ?? "").trim();
+          if (!existingRef) {
+            worksheet["!ref"] = `${cellAddress}:${cellAddress}`;
+          } else {
+            const range = XLSX.utils.decode_range(existingRef);
+            range.s.r = Math.min(range.s.r, rowIndex);
+            range.s.c = Math.min(range.s.c, colIndex);
+            range.e.r = Math.max(range.e.r, rowIndex);
+            range.e.c = Math.max(range.e.c, colIndex);
+            worksheet["!ref"] = XLSX.utils.encode_range(range);
+          }
+
+          XLSX.writeFile(workbook, filePath);
+        },
+      });
+      const updated = fs.statSync(filePath);
+      return { ok: true, updatedAt: updated.mtime.toISOString() };
+    } catch (err) {
+      return { ok: false, error: err instanceof Error ? err.message : String(err) };
+    }
+  }
+);
+
+ipcMain.handle(
+  "template:updateExcelRange",
+  async (
+    _event,
+    payload: {
+      targetPath: string;
+      sheetName: string;
+      startRowIndex: number;
+      startColIndex: number;
+      values: string[][];
+    }
+  ) => {
+    const filePath = String(payload?.targetPath ?? "");
+    if (!filePath) {
+      return { ok: false, error: "文件路径不能为空" };
+    }
+    if (!fs.existsSync(filePath)) {
+      return { ok: false, error: "文件不存在" };
+    }
+    const ext = path.extname(filePath).toLowerCase();
+    if (ext !== ".xlsx" && ext !== ".xls") {
+      return { ok: false, error: "仅支持编辑 xlsx/xls 文件" };
+    }
+    try {
+      const matrix = Array.isArray(payload.values)
+        ? payload.values
+            .map((row) => (Array.isArray(row) ? row.map((cell) => String(cell ?? "")) : []))
+            .filter((row) => row.length > 0)
+        : [];
+      if (matrix.length === 0) {
+        return { ok: false, error: "粘贴内容为空" };
+      }
+      await editTraceStore.recordMutation({
+        operation: "update_excel_range",
+        targetPath: filePath,
+        meta: {
+          sheetName: payload.sheetName,
+          startRowIndex: payload.startRowIndex,
+          startColIndex: payload.startColIndex,
+          rowCount: matrix.length,
+          colCount: matrix[0]?.length ?? 0,
+        },
+        run: () => {
+          const workbook = XLSX.readFile(filePath, { cellDates: true });
+          const fallbackSheetName = workbook.SheetNames[0];
+          if (!fallbackSheetName) {
+            throw new Error("工作簿无可用工作表");
+          }
+          const sheetName = workbook.SheetNames.includes(payload.sheetName)
+            ? payload.sheetName
+            : fallbackSheetName;
+          const worksheet = workbook.Sheets[sheetName];
+          if (!worksheet) {
+            throw new Error("工作表不存在");
+          }
+
+          const startRow = Math.max(0, Number(payload.startRowIndex) || 0);
+          const startCol = Math.max(0, Number(payload.startColIndex) || 0);
+          let maxRow = startRow;
+          let maxCol = startCol;
+
+          for (let rowOffset = 0; rowOffset < matrix.length; rowOffset += 1) {
+            const row = matrix[rowOffset];
+            for (let colOffset = 0; colOffset < row.length; colOffset += 1) {
+              const rowIndex = startRow + rowOffset;
+              const colIndex = startCol + colOffset;
+              const cellAddress = XLSX.utils.encode_cell({ r: rowIndex, c: colIndex });
+              const nextValue = normalizeExcelCellValue(row[colOffset]);
+              worksheet[cellAddress] = {
+                t: typeof nextValue === "number" ? "n" : typeof nextValue === "boolean" ? "b" : "s",
+                v: nextValue as XLSX.CellObject["v"],
+              };
+              maxRow = Math.max(maxRow, rowIndex);
+              maxCol = Math.max(maxCol, colIndex);
+            }
+          }
+
+          const existingRef = String(worksheet["!ref"] ?? "").trim();
+          if (!existingRef) {
+            worksheet["!ref"] = XLSX.utils.encode_range({
+              s: { r: startRow, c: startCol },
+              e: { r: maxRow, c: maxCol },
+            });
+          } else {
+            const range = XLSX.utils.decode_range(existingRef);
+            range.s.r = Math.min(range.s.r, startRow);
+            range.s.c = Math.min(range.s.c, startCol);
+            range.e.r = Math.max(range.e.r, maxRow);
+            range.e.c = Math.max(range.e.c, maxCol);
+            worksheet["!ref"] = XLSX.utils.encode_range(range);
+          }
+
+          XLSX.writeFile(workbook, filePath);
+        },
+      });
+      const updated = fs.statSync(filePath);
+      return { ok: true, updatedAt: updated.mtime.toISOString() };
+    } catch (err) {
+      return { ok: false, error: err instanceof Error ? err.message : String(err) };
+    }
+  }
+);
+
+ipcMain.handle(
+  "template:appendExcelRows",
+  async (
+    _event,
+    payload: {
+      targetPath: string;
+      sheetName: string;
+      count: number;
+    }
+  ) => {
+    const filePath = String(payload?.targetPath ?? "");
+    if (!filePath) {
+      return { ok: false, error: "文件路径不能为空" };
+    }
+    if (!fs.existsSync(filePath)) {
+      return { ok: false, error: "文件不存在" };
+    }
+    const ext = path.extname(filePath).toLowerCase();
+    if (ext !== ".xlsx" && ext !== ".xls") {
+      return { ok: false, error: "仅支持编辑 xlsx/xls 文件" };
+    }
+    try {
+      await editTraceStore.recordMutation({
+        operation: "append_excel_rows",
+        targetPath: filePath,
+        meta: {
+          sheetName: payload.sheetName,
+          count: payload.count,
+        },
+        run: () => {
+          const workbook = XLSX.readFile(filePath, { cellDates: true });
+          const fallbackSheetName = workbook.SheetNames[0];
+          if (!fallbackSheetName) {
+            throw new Error("工作簿无可用工作表");
+          }
+          const sheetName = workbook.SheetNames.includes(payload.sheetName)
+            ? payload.sheetName
+            : fallbackSheetName;
+          const worksheet = workbook.Sheets[sheetName];
+          if (!worksheet) {
+            throw new Error("工作表不存在");
+          }
+          const count = Math.max(1, Math.min(200, Number(payload.count) || 1));
+          const existingRef = String(worksheet["!ref"] ?? "").trim();
+          if (!existingRef) {
+            const endRow = Math.max(0, count - 1);
+            worksheet["!ref"] = XLSX.utils.encode_range({
+              s: { r: 0, c: 0 },
+              e: { r: endRow, c: 0 },
+            });
+          } else {
+            const range = XLSX.utils.decode_range(existingRef);
+            range.e.r += count;
+            worksheet["!ref"] = XLSX.utils.encode_range(range);
+          }
+
+          XLSX.writeFile(workbook, filePath);
+        },
+      });
+      const updated = fs.statSync(filePath);
+      return { ok: true, updatedAt: updated.mtime.toISOString() };
+    } catch (err) {
+      return { ok: false, error: err instanceof Error ? err.message : String(err) };
+    }
+  }
+);
+
+ipcMain.handle(
+  "template:trimExcelSheet",
+  async (
+    _event,
+    payload: {
+      targetPath: string;
+      sheetName: string;
+      axis: "row" | "col";
+      count: number;
+    }
+  ) => {
+    const filePath = String(payload?.targetPath ?? "");
+    if (!filePath) {
+      return { ok: false, error: "文件路径不能为空" };
+    }
+    if (!fs.existsSync(filePath)) {
+      return { ok: false, error: "文件不存在" };
+    }
+    const ext = path.extname(filePath).toLowerCase();
+    if (ext !== ".xlsx" && ext !== ".xls") {
+      return { ok: false, error: "仅支持编辑 xlsx/xls 文件" };
+    }
+    try {
+      await editTraceStore.recordMutation({
+        operation: "trim_excel_sheet",
+        targetPath: filePath,
+        meta: {
+          sheetName: payload.sheetName,
+          axis: payload.axis,
+          count: payload.count,
+        },
+        run: () => {
+          const workbook = XLSX.readFile(filePath, { cellDates: true });
+          const fallbackSheetName = workbook.SheetNames[0];
+          if (!fallbackSheetName) {
+            throw new Error("工作簿无可用工作表");
+          }
+          const sheetName = workbook.SheetNames.includes(payload.sheetName)
+            ? payload.sheetName
+            : fallbackSheetName;
+          const worksheet = workbook.Sheets[sheetName];
+          if (!worksheet) {
+            throw new Error("工作表不存在");
+          }
+          const existingRef = String(worksheet["!ref"] ?? "").trim();
+          if (!existingRef) {
+            throw new Error("工作表为空，无法删除");
+          }
+          const range = XLSX.utils.decode_range(existingRef);
+          const count = Math.max(1, Math.min(200, Number(payload.count) || 1));
+
+          if (payload.axis === "row") {
+            const oldEndRow = range.e.r;
+            const newEndRow = Math.max(range.s.r, oldEndRow - count);
+            if (newEndRow === oldEndRow) {
+              throw new Error("已无法继续删除末行");
+            }
+            for (let r = newEndRow + 1; r <= oldEndRow; r += 1) {
+              for (let c = range.s.c; c <= range.e.c; c += 1) {
+                const addr = XLSX.utils.encode_cell({ r, c });
+                delete worksheet[addr];
+              }
+            }
+            range.e.r = newEndRow;
+          } else {
+            const oldEndCol = range.e.c;
+            const newEndCol = Math.max(range.s.c, oldEndCol - count);
+            if (newEndCol === oldEndCol) {
+              throw new Error("已无法继续删除末列");
+            }
+            for (let c = newEndCol + 1; c <= oldEndCol; c += 1) {
+              for (let r = range.s.r; r <= range.e.r; r += 1) {
+                const addr = XLSX.utils.encode_cell({ r, c });
+                delete worksheet[addr];
+              }
+            }
+            range.e.c = newEndCol;
+          }
+
+          worksheet["!ref"] = XLSX.utils.encode_range(range);
+          XLSX.writeFile(workbook, filePath);
+        },
+      });
+      const updated = fs.statSync(filePath);
+      return { ok: true, updatedAt: updated.mtime.toISOString() };
+    } catch (err) {
+      return { ok: false, error: err instanceof Error ? err.message : String(err) };
+    }
+  }
+);
+
 ipcMain.handle("template:preview", async (_event, filePath: string) => {
   currentFilePath = filePath;
   setupWatcher(filePath);
@@ -1020,6 +1416,44 @@ ipcMain.handle("template:unwatch", async () => {
     watcher = null;
   }
   currentFilePath = null;
+});
+
+ipcMain.handle("trace:list", async (_event, targetPath?: string) => {
+  const normalizedPath = String(targetPath ?? "").trim();
+  return editTraceStore.list(normalizedPath || undefined);
+});
+
+ipcMain.handle("trace:get", async (_event, eventId: string) => {
+  const id = String(eventId ?? "").trim();
+  if (!id) {
+    return null;
+  }
+  return editTraceStore.get(id);
+});
+
+ipcMain.handle("trace:replay", async (_event, eventId: string) => {
+  const id = String(eventId ?? "").trim();
+  if (!id) {
+    return { ok: false, error: "事件ID不能为空" };
+  }
+  const event = editTraceStore.get(id);
+  if (!event) {
+    return { ok: false, error: "事件不存在" };
+  }
+  if (!event.replayText) {
+    return { ok: false, error: "当前事件不支持文本回放" };
+  }
+  return {
+    ok: true,
+    targetPath: event.targetPath,
+    content: event.replayText,
+    timestamp: event.timestamp,
+  };
+});
+
+ipcMain.handle("trace:clear", async () => {
+  editTraceStore.clear();
+  return { ok: true };
 });
 
 ipcMain.handle("agent:chat", async (_event, request: { message: string; payload?: unknown }) => {
