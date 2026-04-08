@@ -25,6 +25,14 @@ class _EmbeddingCacheEntry:
     emb_matrix: Any
 
 
+@dataclass
+class _EmbeddingCacheEntry:
+    signature: str
+    texts: List[str]
+    metadata: List[Dict[str, str]]
+    emb_matrix: Any
+
+
 def _normalize(text: str) -> str:
     return re.sub(r"\s+", " ", text or "").strip().lower()
 

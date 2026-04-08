@@ -1,3 +1,11 @@
+"""
+agent/parser/utils/ocr_utils.py
+
+OCR 工具 —— 通过 ds API (Paratera 平台) 实现。
+API 文档: https://ai.paratera.com/document/llm/quickStart/useApi
+
+调用方式：OpenAI 兼容的 Chat Completions 接口，发送 base64 图片。
+"""
 from __future__ import annotations
 
 import base64
@@ -16,7 +24,7 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # 配置（从环境变量读取，不要硬编码密钥）
 # ---------------------------------------------------------------------------
-PARATERA_API_KEY = "sk-5R4W1WGRwgQPkmsoTs0rrw"
+PARATERA_API_KEY = "sk-YNXuBle27-wX1oeQZmlRCg"
 PARATERA_API_BASE = os.environ.get(
     "PARATERA_API_BASE", "https://llmapi.paratera.com"
 )
