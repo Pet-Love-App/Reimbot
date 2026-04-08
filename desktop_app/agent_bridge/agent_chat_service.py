@@ -202,25 +202,35 @@ def _memory_flush_daemon() -> None:
     try:
         while not _MEMORY_FLUSH_STOP_EVENT.wait(_MEMORY_FLUSH_INTERVAL):
             try:
+                snapshot = None
                 with _MEMORY_CACHE_LOCK:
-                    if not _MEMORY_DIRTY or _MEMORY_CACHE is None:
-                        continue
-                    _save_memory_store_immediate(_MEMORY_CACHE)
-                    _MEMORY_DIRTY = False
+                    if _MEMORY_DIRTY and _MEMORY_CACHE is not None:
+                        snapshot = copy.deepcopy(_MEMORY_CACHE)
+                if snapshot is None:
+                    continue
+                _save_memory_store_immediate(snapshot)
+                with _MEMORY_CACHE_LOCK:
+                    if _MEMORY_DIRTY and _MEMORY_CACHE == snapshot:
+                        _MEMORY_DIRTY = False
             except Exception:
                 # ignore flush errors; next cycle will retry
                 pass
     finally:
         # On thread exit, attempt one final immediate flush to reduce data loss.
         try:
+            snapshot = None
             with _MEMORY_CACHE_LOCK:
                 if _MEMORY_DIRTY and _MEMORY_CACHE is not None:
-                    try:
-                        _save_memory_store_immediate(_MEMORY_CACHE)
-                        _MEMORY_DIRTY = False
-                    except Exception:
-                        # last-resort: ignore
-                        pass
+                    snapshot = copy.deepcopy(_MEMORY_CACHE)
+            if snapshot is not None:
+                try:
+                    _save_memory_store_immediate(snapshot)
+                    with _MEMORY_CACHE_LOCK:
+                        if _MEMORY_DIRTY and _MEMORY_CACHE == snapshot:
+                            _MEMORY_DIRTY = False
+                except Exception:
+                    # last-resort: ignore
+                    pass
         except Exception:
             pass
 
@@ -430,12 +440,17 @@ def _reset_memory_session(payload: Dict[str, Any]) -> None:
     sessions = store.setdefault("sessions", {})
     if isinstance(sessions, dict):
         sessions.pop(session_key, None)
-    # persist immediately for reset operations
+    # Always update the in-memory cache for this process first, then attempt
+    # an immediate flush so reset operations become durable on disk promptly.
+    _save_memory_store(store)
     try:
         _save_memory_store_immediate(store)
+        with _MEMORY_CACHE_LOCK:
+            _MEMORY_DIRTY = False
     except Exception:
-        # fallback to marking dirty in cache
-        _save_memory_store(store)
+        # Cache is already updated and marked dirty; background flush will
+        # persist it if the immediate write fails.
+        pass
 
 
 def _summarize_messages(messages: List[Dict[str, str]], *, max_chars: int = 900) -> str:
@@ -630,15 +645,28 @@ def _remember_turn(payload: Dict[str, Any], user_message: str, assistant_reply: 
     if len(dq) > short_limit:
         keep_recent = max(short_limit // 2, 4)
         list_all = list(dq)
+
+        # Normalize ids for legacy persisted entries and avoid duplicate ids so
+        # trimming/overflow logic can reliably identify individual messages.
+        seen_ids: Set[str] = set()
+        for item in list_all:
+            item_id = item.get("id")
+            if not item_id or item_id in seen_ids:
+                item_id = uuid.uuid4().hex
+                item["id"] = item_id
+            seen_ids.add(item_id)
+
         recent = list_all[-keep_recent:]
         older = list_all[:-keep_recent]
         need = max(short_limit - keep_recent, 0)
         # select top important from older
         selected = sorted(older, key=lambda x: float(x.get("importance", 0.0)), reverse=True)[:need]
-        final_short = recent + selected
+        kept_ids = {it["id"] for it in recent}
+        kept_ids.update(it["id"] for it in selected)
+        # Preserve original chronological order when combining recent and selected.
+        final_short = [it for it in list_all if it["id"] in kept_ids]
         # compute overflow
-        final_ids = {it.get("id") for it in final_short}
-        overflow = [it for it in list_all if it.get("id") not in final_ids]
+        overflow = [it for it in list_all if it["id"] not in kept_ids]
         # update session short_term as list for persistence
         session["short_term"] = final_short
         # summarize overflow into rolling_summary
