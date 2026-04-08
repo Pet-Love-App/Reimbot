@@ -1,0 +1,82 @@
+{
+  "metadata": {
+    "source_dir": "E:\\Desktop\\agent\\docs\\sandbox",
+    "built_at": "2026-04-07T21:00:07",
+    "chunk_size": 700,
+    "overlap": 100,
+    "file_count": 6,
+    "chunk_count": 11,
+    "strategy": "direct",
+    "category_counts": {
+      "未分类": 11
+    }
+  },
+  "chunks": [
+    {
+      "id": "architecture_design.md#1",
+      "source": "architecture_design.md",
+      "title": "architecture_design-片段1",
+      "content": "# Code Sandbox 架构设计文档\n\n## 1. 现状评估结论\n- 当前系统未集成代码沙箱安全执行环境。\n- 未发现 Docker/WASM/Firecracker/V8 Isolate 的统一执行入口。\n- 未发现 seccomp-BPF、Capabilities 降权、AppArmor/SELinux 策略接入。\n- 未发现针对动态代码执行的审计链路与实时风险拦截。\n\n## 2. 核心技术选型\n- 主执行引擎: Docker 容器沙箱（已实现）。\n- 预留扩展接口: `SandboxPolicy.technology` 支持 `docker/wasm/firecracker/v8` 兼容扩展。\n- 原因:\n - 工程可落地性高，便于与现有 Python 调度系统融合。\n - 支持 cgroup 资源配额、seccomp、capabilities、只读根文件系统。\n\n## 3. 资源限制策略\n- CPU: `--cpus`，默认 `1.0`。\n- 内存: `--memory`，默认 `512MB`。\n- 进程数: `--pids-limit`，默认 `64`。\n- 磁盘: 通过只读根文件系统 + 独立临时挂载目录控制写入范围。\n- 网络: 默认 `--network none`，阻断外联。\n- 熔断机制: `CircuitBreaker` 在窗口期失败次数超阈值时开启熔断。"
+    },
+    {
+      "id": "architecture_design.md#2",
+      "source": "architecture_design.md",
+      "title": "architecture_design-片段2",
+      "content": "只读根文件系统 + 独立临时挂载目录控制写入范围。\n- 网络: 默认 `--network none`，阻断外联。\n- 熔断机制: `CircuitBreaker` 在窗口期失败次数超阈值时开启熔断。\n\n## 4. 安全隔离规范\n- 系统调用白名单: `SandboxPolicy.syscall_whitelist` + 运行时检查。\n- seccomp-BPF: `agent/sandbox/profiles/seccomp-default.json`。\n- Capabilities 降权: `--cap-drop ALL`。\n- no-new-privileges: `--security-opt no-new-privileges:true`。\n- AppArmor: `agent/sandbox/profiles/apparmor-sandbox.profile`。\n- SELinux: 生产环境建议使用容器标签隔离（文档策略，按部署平台启用）。"
+    },
+    {
+      "id": "architecture_design.md#3",
+      "source": "architecture_design.md",
+      "title": "architecture_design-片段3",
+      "content": "ppArmor: `agent/sandbox/profiles/apparmor-sandbox.profile`。\n- SELinux: 生产环境建议使用容器标签隔离（文档策略，按部署平台启用）。\n\n## 5. 动态执行流程\n1. 提交: `ExecutionRequest` 接收用户代码。\n2. 静态扫描: `StaticSecurityScanner` 阻断高危模式。\n3. 签名: `sign_code` 生成 `code_hash + signature`。\n4. 沙箱启动: `DockerSandboxDriver.run` 按配额启动容器。\n5. 运行时监控: 解析 `EVENT:*` 并进行风险判定。\n6. 结果回收: 收集 stdout/stderr/telemetry。\n7. 沙箱销毁: Docker `--rm` 自动清理容器。\n\n## 6. 风险行为实时检测与拦截\n- 文件系统越权: 拦截 `..`、`/etc`、`/proc` 路径事件。\n- 网络外联: 监控到 network 事件即阻断。\n- 子进程创建: process 事件触发阻断。\n- 敏感 API: 命中 `os.system/subprocess/socket/eval/exec` 等关键词阻断。\n\n## 7. 性能与扩容指标\n- 冷启动目标: `<= 800ms`（以轻量镜像与预热池达成）。\n- 并发目标: `1000` 实例（配合队列与多节点调度）。\n- 扩容阈值: 当 `CPU 利用率 <= 80%` 时触发横向扩容（按需求定义实现为策略阈值）。"
+    },
+    {
+      "id": "architecture_design.md#4",
+      "source": "architecture_design.md",
+      "title": "architecture_design-片段4",
+      "content": "00ms`（以轻量镜像与预热池达成）。\n- 并发目标: `1000` 实例（配合队列与多节点调度）。\n- 扩容阈值: 当 `CPU 利用率 <= 80%` 时触发横向扩容（按需求定义实现为策略阈值）。\n\n## 8. 高可用部署建议\n- 多可用区: 控制面和执行面跨 AZ 部署。\n- 故障转移: 健康检查 + 流量切换，目标 `<= 30s`。\n- 备份目标: 审计日志与执行元数据 `RPO <= 5min`。\n\n## 9. 审计与合规\n- 日志字段:\n - 用户 ID\n - 代码哈希\n - 执行时长\n - 系统调用序列\n - 异常事件\n- 存储:\n - `data/audit/sandbox_audit.jsonl`\n - 默认保留 180 天（`AuditLogger.retention_days`）。"
+    },
+    {
+      "id": "operations_manual.md#1",
+      "source": "operations_manual.md",
+      "title": "operations_manual-片段1",
+      "content": "# Code Sandbox 运维手册\n\n## 1. 部署前检查\n- 安装 Docker Engine。\n- 启用 AppArmor/SELinux（按宿主机平台）。\n- 配置环境变量:\n - `SANDBOX_SIGNING_KEY`\n - `AGENT_PROJECT_ROOT`（可选）\n\n## 2. 启动与调用\n- 任务模式:\n - `task_type = sandbox_exec`\n - payload 必填: `user_id`, `language`, `code`\n- CLI 模式:\n - `python -m agent.sandbox.cli scan --code-file demo.py`\n - `python -m agent.sandbox.cli exec --user-id u1 --language python --code-file demo.py`\n\n## 3. 监控指标\n- `sandbox_execution_total`\n- `sandbox_execution_denied_total`\n- `sandbox_execution_blocked_total`\n- `sandbox_circuit_breaker_open`\n- `sandbox_duration_ms`"
+    },
+    {
+      "id": "operations_manual.md#2",
+      "source": "operations_manual.md",
+      "title": "operations_manual-片段2",
+      "content": "_total`\n- `sandbox_execution_blocked_total`\n- `sandbox_circuit_breaker_open`\n- `sandbox_duration_ms`\n\n## 4. 故障处理\n- Docker 不可用:\n - 检查 `docker info` 与 daemon 状态。\n- 熔断开启:\n - 观察近 60s 失败率，排查镜像、策略和资源瓶颈。\n- 日志写入失败:\n - 检查 `data/audit` 目录权限与磁盘空间。\n\n## 5. 备份与恢复\n- 审计日志每 5 分钟同步到对象存储。\n- 恢复顺序:\n 1) 恢复日志索引\n 2) 恢复执行元数据\n 3) 重放关键事件"
+    },
+    {
+      "id": "performance_benchmark_report.md#1",
+      "source": "performance_benchmark_report.md",
+      "title": "performance_benchmark_report-片段1",
+      "content": "# Code Sandbox 性能压测报告\n\n## 1. 测试目标\n- 冷启动延迟: <= 800ms\n- 并发能力: 1000 实例\n- 扩容阈值: CPU 利用率 <= 80% 触发横向扩容\n\n## 2. 测试环境\n- 节点规格: 8 vCPU / 32 GB RAM\n- 容器镜像: `python:3.11-alpine`\n- 执行任务: `print(\"hello\")` 与 CPU/IO 混合任务\n- 压测工具: k6 + 自定义执行器 API\n\n## 3. 指标定义\n- p50/p95/p99 启动耗时\n- 容器创建失败率\n- 平均执行时长\n- 节点 CPU/内存利用率\n- 熔断触发次数\n\n## 4. 基线结果（样例）\n- 冷启动:\n - p50: 420ms\n - p95: 760ms\n - p99: 905ms（超标，建议镜像预热）\n- 并发:\n - 1000 并发下成功率 99.2%\n - 平均执行时长 1.4s\n- 资源:\n - CPU 峰值 78%\n - 内存峰值 71%\n\n## 5. 优化建议\n- 预热容器池减少冷启动抖动。\n- 拆分队列为短任务和长任务通道。\n- 将审计日志异步批量写入对象存储。"
+    },
+    {
+      "id": "security_penetration_test_report.md#1",
+      "source": "security_penetration_test_report.md",
+      "title": "security_penetration_test_report-片段1",
+      "content": "# Code Sandbox 安全渗透测试报告\n\n## 1. 测试范围\n- 代码提交接口\n- 静态扫描策略\n- 容器隔离参数（seccomp/capabilities/AppArmor）\n- 风险行为检测链路\n- 审计日志完整性\n\n## 2. 测试方法\n- 黑盒:\n - 构造恶意脚本（反弹 shell、fork bomb、外联）\n- 灰盒:\n - 校验容器启动参数、策略配置、日志字段\n\n## 3. 攻击用例与结论\n- 文件越权访问: `open('/etc/passwd')`\n - 结果: 被静态扫描与运行时规则阻断。\n- 网络外联: `socket` + HTTP 请求\n - 结果: `network none` + 风险检测阻断。\n- 子进程逃逸: `subprocess.Popen`\n - 结果: 静态扫描直接拒绝。\n- 敏感 API: `eval/exec`\n - 结果: 静态扫描拒绝。\n\n## 4. 发现问题\n- 低风险:\n - 默认签名密钥可通过环境变量覆盖，但需在生产强制非默认值。\n\n## 5. 整改项\n- 上线前校验 `SANDBOX_SIGNING_KEY` 复杂度。\n- 增加镜像签名验签与漏洞扫描门禁。"
+    },
+    {
+      "id": "sla_commitment.md#1",
+      "source": "sla_commitment.md",
+      "title": "sla_commitment-片段1",
+      "content": "# Code Sandbox SLA 承诺书\n\n## 服务级别目标\n- 可用性: 99.9%（月度）\n- 故障转移时间: <= 30s\n- 数据备份 RPO: <= 5min\n- 审计日志保留: >= 180 天\n\n## 性能目标\n- 冷启动时延: <= 800ms（p95）\n- 并发处理能力: >= 1000 实例\n- 资源扩展策略: CPU 利用率 <= 80% 时触发横向扩容\n\n## 安全目标\n- 默认隔离: 容器只读根文件系统 + 无外联网络\n- 权限最小化: drop capabilities + no-new-privileges\n- 风险拦截: 越权文件访问/子进程/敏感 API/外联行为实时阻断\n\n## 违约补偿\n- 当月可用性低于 99.9%:\n - 99.0%~99.9%: 10% 服务费用减免\n - <99.0%: 25% 服务费用减免"
+    },
+    {
+      "id": "threat_model_report.md#1",
+      "source": "threat_model_report.md",
+      "title": "threat_model_report-片段1",
+      "content": "# Code Sandbox 威胁建模报告\n\n## 1. 资产清单\n- 执行节点主机资源（CPU/内存/磁盘/网络）。\n- 平台密钥与凭据（签名密钥、CI 凭据）。\n- 审计日志与任务元数据。\n- 业务系统 API 与内部网络。\n\n## 2. 攻击面\n- 用户提交代码（核心不可信输入）。\n- 容器运行时与镜像供应链。\n- CI/CD 流水线与依赖包。\n- 审计日志与对象存储读写接口。\n\n## 3. STRIDE 分析\n- Spoofing: 伪造用户身份提交任务。\n - 控制: 强制 user_id + 鉴权网关签名。\n- Tampering: 篡改执行代码或日志。\n - 控制: 代码哈希签名、不可变日志存储。\n- Repudiation: 提交者否认执行行为。\n - 控制: 审计日志落地（用户ID+哈希+时间）。\n- Information Disclosure: 越权读取宿主机或敏感文件。\n - 控制: 只读根文件系统、路径校验、系统调用限制。\n- Denial of Service: 死循环、fork 炸弹、资源耗尽。\n - 控制: CPU/内存/pids/超时限制 + 熔断。\n- Elevation of Privilege: 容器逃逸、提权。\n - 控制: cap-drop、no-new-privileges、seccomp、AppArmor。\n\n## 4. 风险分级\n- 高风险:\n - 容器逃逸\n - 任意命令执行\n - 横向网络扫描\n- 中风险:\n - 非授权文件访问\n - 日志注入\n- 低风险:\n - 非敏感资源误用"
+    },
+    {
+      "id": "threat_model_report.md#2",
+      "source": "threat_model_report.md",
+      "title": "threat_model_report-片段2",
+      "content": "AppArmor。\n\n## 4. 风险分级\n- 高风险:\n - 容器逃逸\n - 任意命令执行\n - 横向网络扫描\n- 中风险:\n - 非授权文件访问\n - 日志注入\n- 低风险:\n - 非敏感资源误用\n\n## 5. 缓解与残余风险\n- 已缓解:\n - 绝大多数脚本级命令注入与网络外联。\n- 残余:\n - 0day 内核漏洞导致容器隔离失效。\n - 供应链镜像投毒。\n- 额外建议:\n - 镜像签名验证（cosign）\n - 节点最小化 OS + 自动补丁\n - eBPF 行为基线告警"
+    }
+  ]
+}

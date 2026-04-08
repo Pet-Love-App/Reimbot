@@ -118,6 +118,8 @@ def rag_retrieve(
             "title": item.title,
             "content": item.content,
             "score": float(item.score),
+            "category": getattr(item, "category", ""),
+            "doc_type": getattr(item, "doc_type", ""),
         }
         for item in items
     ]

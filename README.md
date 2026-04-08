@@ -298,6 +298,76 @@ data/
 python -m unittest discover -s tests
 ```
 
+## RAG 评估（TruLens）
+
+已接入 `TruLens` 离线评估入口，用于评估当前检索链路（`search_policy`）在真实知识库上的表现。
+
+### 1. 安装依赖
+
+```bash
+pip install -r requirements.txt
+```
+
+### 2. 直接基于知识库自动生成评估问题并运行
+
+```bash
+python run_trulens_eval.py --kb-path data/kb/reimbursement_kb.json --top-k 4 --max-samples 30
+```
+
+### 3. 指定自定义评估集
+
+```bash
+python run_trulens_eval.py --kb-path data/kb/reimbursement_kb.json --dataset data/eval/qa_eval_samples.json
+```
+
+启用 LLM Judge（可选）：
+
+```bash
+python run_trulens_eval.py --dataset data/eval/qa_eval_samples.json --use-llm-judge --judge-model gpt-4o-mini
+```
+
+说明：
+
+- 需配置 `AGENT_LLM_API_KEY`，可选配置 `AGENT_LLM_BASE_URL`
+- 若 Judge 初始化失败，会自动回退为启发式评分，并在结果 `summary.feedback_warnings` 中记录原因
+
+评估集 JSON 示例：
+
+```json
+[
+  {
+    "id": "q1",
+    "question": "高铁一等座是否允许报销？",
+    "expected_keywords": ["高铁", "报销", "一等座"]
+  }
+]
+```
+
+输出结果：
+
+- 默认落盘到 `data/eval/trulens_rag_eval_*.json`
+- `summary` 包含样本数和平均得分
+- `records` 包含每条问题的检索上下文、引用与打分
+
+## 合成数据（SFT）
+
+可基于空白模板批量生成“指令-输入-输出”数据，用于表单填充类任务微调。
+
+1) 使用内置模板生成：
+
+```bash
+python scripts/generate_sft_synthetic_data.py --template data/eval/sft_template_form_fill.json --output data/eval/sft_synthetic_data.jsonl --count 500
+```
+
+2) 若你已配置兼容 OpenAI 的模型接口（例如智谱兼容网关），可启用 LLM 生成并自动回退规则生成：
+
+```bash
+$env:AGENT_SYNTH_API_KEY="<your_key>"
+python scripts/generate_sft_synthetic_data.py --template data/eval/sft_template_form_fill.json --use-llm --count 500
+```
+
+输出为 JSONL，每行包含 `instruction / input / output / meta` 字段。
+
 ## 贡献指南
 
 欢迎通过 `Issue` 和 `Pull Request` 参与项目改进。

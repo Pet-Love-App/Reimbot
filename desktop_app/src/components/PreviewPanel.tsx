@@ -6,6 +6,24 @@ import { vscDarkPlus } from "react-syntax-highlighter/dist/esm/styles/prism";
 
 type Props = {
   preview: FilePreview | null;
+  onExcelCellChange?: (
+    sheetName: string,
+    rowIndex: number,
+    colIndex: number,
+    value: string
+  ) => Promise<void> | void;
+  onExcelRangeChange?: (
+    sheetName: string,
+    startRowIndex: number,
+    startColIndex: number,
+    values: string[][]
+  ) => Promise<void> | void;
+  onExcelAppendRows?: (sheetName: string, count: number) => Promise<void> | void;
+  onExcelTrimSheet?: (
+    sheetName: string,
+    axis: "row" | "col",
+    count: number
+  ) => Promise<void> | void;
 };
 
 function buildColumnWidths(rows: string[][]): number[] {
@@ -42,10 +60,82 @@ function isLikelyNumericCell(value: string): boolean {
   return /^[-+]?((\d+(\.\d+)?)|(\.\d+))%?$/.test(text.replace(/,/g, ""));
 }
 
-function renderExcel(preview: TemplatePreview) {
+function renderExcel(
+  preview: TemplatePreview,
+  editingCell: { sheetName: string; rowIndex: number; colIndex: number; value: string } | null,
+  setEditingCell: (
+    value: { sheetName: string; rowIndex: number; colIndex: number; value: string } | null
+  ) => void,
+  commitEditingCell: () => Promise<void>,
+  excelSaving: boolean,
+  setExcelSaving: (value: boolean) => void,
+  appendCount: number,
+  setAppendCount: (value: number) => void,
+  onExcelRangeChange?: (
+    sheetName: string,
+    startRowIndex: number,
+    startColIndex: number,
+    values: string[][]
+  ) => Promise<void> | void,
+  onExcelAppendRows?: (sheetName: string, count: number) => Promise<void> | void,
+  onExcelTrimSheet?: (sheetName: string, axis: "row" | "col", count: number) => Promise<void> | void
+) {
   return preview.sheets.map((sheet) => (
     <section key={sheet.name} className="sheet-card">
-      <h3>{sheet.name}</h3>
+      <div className="sheet-toolbar">
+        <h3>{sheet.name}</h3>
+        <button
+          type="button"
+          className="excel-action-btn"
+          disabled={excelSaving || !onExcelAppendRows}
+          onClick={() => {
+            if (!onExcelAppendRows) return;
+            setExcelSaving(true);
+            void Promise.resolve(onExcelAppendRows(sheet.name, appendCount)).finally(() => {
+              setExcelSaving(false);
+            });
+          }}
+        >
+          追加 {appendCount} 行
+        </button>
+        <input
+          type="number"
+          min={1}
+          max={200}
+          className="excel-count-input"
+          value={appendCount}
+          onChange={(event) => setAppendCount(Math.max(1, Math.min(200, Number(event.target.value) || 1)))}
+        />
+        <button
+          type="button"
+          className="excel-action-btn"
+          disabled={excelSaving || !onExcelTrimSheet}
+          onClick={() => {
+            if (!onExcelTrimSheet) return;
+            setExcelSaving(true);
+            void Promise.resolve(onExcelTrimSheet(sheet.name, "row", 1)).finally(() => {
+              setExcelSaving(false);
+            });
+          }}
+        >
+          删除末行
+        </button>
+        <button
+          type="button"
+          className="excel-action-btn"
+          disabled={excelSaving || !onExcelTrimSheet}
+          onClick={() => {
+            if (!onExcelTrimSheet) return;
+            setExcelSaving(true);
+            void Promise.resolve(onExcelTrimSheet(sheet.name, "col", 1)).finally(() => {
+              setExcelSaving(false);
+            });
+          }}
+        >
+          删除末列
+        </button>
+      </div>
+      <p className="placeholder">双击单元格可编辑并写回文件。</p>
       <div className="table-wrap template-html-block">
         {sheet.rows.length === 0 ? (
           <table className="excel-preview-table">
@@ -88,8 +178,74 @@ function renderExcel(preview: TemplatePreview) {
                             className={
                               isEmpty ? "excel-cell-empty" : isNumeric ? "excel-cell-number" : undefined
                             }
+                            onDoubleClick={() =>
+                              setEditingCell({
+                                sheetName: sheet.name,
+                                rowIndex,
+                                colIndex: cellIndex,
+                                value: cell,
+                              })
+                            }
                           >
-                            {cell ? <span className="excel-cell-text" title={cell}>{cell}</span> : "∅"}
+                            {editingCell &&
+                            editingCell.sheetName === sheet.name &&
+                            editingCell.rowIndex === rowIndex &&
+                            editingCell.colIndex === cellIndex ? (
+                              <input
+                                className="excel-edit-input"
+                                autoFocus
+                                value={editingCell.value}
+                                disabled={excelSaving}
+                                onChange={(event) =>
+                                  setEditingCell({
+                                    ...editingCell,
+                                    value: event.target.value,
+                                  })
+                                }
+                                onBlur={() => {
+                                  void commitEditingCell();
+                                }}
+                                onKeyDown={(event) => {
+                                  if (event.key === "Enter") {
+                                    event.preventDefault();
+                                    void commitEditingCell();
+                                  }
+                                  if (event.key === "Escape") {
+                                    event.preventDefault();
+                                    setEditingCell(null);
+                                  }
+                                }}
+                                onPaste={(event) => {
+                                  const raw = event.clipboardData?.getData("text/plain") ?? "";
+                                  if (!raw || (!raw.includes("\t") && !raw.includes("\n"))) {
+                                    return;
+                                  }
+                                  event.preventDefault();
+                                  const rows = raw
+                                    .replace(/\r\n/g, "\n")
+                                    .replace(/\r/g, "\n")
+                                    .split("\n")
+                                    .filter((line) => line.length > 0)
+                                    .map((line) => line.split("\t"));
+                                  if (!rows.length || !onExcelRangeChange) {
+                                    return;
+                                  }
+                                  setExcelSaving(true);
+                                  void Promise.resolve(
+                                    onExcelRangeChange(sheet.name, rowIndex, cellIndex, rows)
+                                  ).finally(() => {
+                                    setExcelSaving(false);
+                                    setEditingCell(null);
+                                  });
+                                }}
+                              />
+                            ) : cell ? (
+                              <span className="excel-cell-text" title={cell}>
+                                {cell}
+                              </span>
+                            ) : (
+                              "∅"
+                            )}
                           </td>
                         );
                       })}
@@ -130,20 +286,53 @@ function renderTemplate(preview: TemplatePreview) {
           ))}
         </div>
       )}
-
-      {preview.fileType === "xlsx" || preview.fileType === "xls" ? renderExcel(preview) : renderDocLike(preview)}
+      {renderDocLike(preview)}
     </>
   );
 }
 
-export function PreviewPanel({ preview }: Props) {
+export function PreviewPanel({
+  preview,
+  onExcelCellChange,
+  onExcelRangeChange,
+  onExcelAppendRows,
+  onExcelTrimSheet,
+}: Props) {
   const [pdfPage, setPdfPage] = useState(1);
   const [pdfZoom, setPdfZoom] = useState(100);
+  const [excelSaving, setExcelSaving] = useState(false);
+  const [editingCell, setEditingCell] = useState<{
+    sheetName: string;
+    rowIndex: number;
+    colIndex: number;
+    value: string;
+  } | null>(null);
+  const [appendCount, setAppendCount] = useState(1);
 
   useEffect(() => {
     setPdfPage(1);
     setPdfZoom(100);
+    setEditingCell(null);
   }, [preview?.kind === "template" ? preview.data.filePath : ""]);
+
+  const commitEditingCell = async () => {
+    if (!editingCell || !onExcelCellChange) {
+      setEditingCell(null);
+      return;
+    }
+    setExcelSaving(true);
+    try {
+      await onExcelCellChange(
+        editingCell.sheetName,
+        editingCell.rowIndex,
+        editingCell.colIndex,
+        editingCell.value
+      );
+    } finally {
+      setExcelSaving(false);
+      setEditingCell(null);
+    }
+  };
 
   if (!preview) {
     return <div className="empty-state">请选择文件开始预览</div>;
@@ -201,7 +390,25 @@ export function PreviewPanel({ preview }: Props) {
         </div>
       );
     }
-    return <div className="preview-panel">{renderTemplate(data)}</div>;
+    return (
+      <div className="preview-panel">
+        {data.fileType === "xlsx" || data.fileType === "xls"
+          ? renderExcel(
+              data,
+              editingCell,
+              setEditingCell,
+              commitEditingCell,
+              excelSaving,
+              setExcelSaving,
+              appendCount,
+              setAppendCount,
+              onExcelRangeChange,
+              onExcelAppendRows,
+              onExcelTrimSheet
+            )
+          : renderTemplate(data)}
+      </div>
+    );
   }
 
   const lowerType = preview.fileType.toLowerCase();
@@ -258,12 +465,15 @@ export function PreviewPanel({ preview }: Props) {
             <SyntaxHighlighter
               language={codeLanguage}
               style={vscDarkPlus}
+              showLineNumbers
+              wrapLongLines
               customStyle={{
                 margin: 0,
                 background: "transparent",
                 padding: "16px",
+                color: "#e5e7eb",
                 fontSize: "12px",
-                lineHeight: "1.6",
+                lineHeight: "1.7",
               }}
             >
               {preview.content}

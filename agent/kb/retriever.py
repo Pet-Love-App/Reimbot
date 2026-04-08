@@ -13,6 +13,16 @@ class RetrievedChunk:
     title: str
     content: str
     score: float
+    category: str = ""
+    doc_type: str = ""
+
+
+@dataclass
+class _EmbeddingCacheEntry:
+    signature: str
+    texts: List[str]
+    metadata: List[Dict[str, str]]
+    emb_matrix: Any
 
 
 @dataclass
@@ -214,6 +224,8 @@ def retrieve_chunks(query: str, *, kb_path: str | Path, top_k: int = 4) -> List[
                 title=str(item.get("title", "未命名片段")),
                 content=str(item.get("content", "")).strip(),
                 score=score,
+                category=str(item.get("category", "")),
+                doc_type=str(item.get("doc_type", "")),
             )
         )
 
@@ -277,11 +289,20 @@ def search_policy(query: str, top_k: int = 3, kb_path: Optional[str | Path] = No
         source = str(item.get("source", "未知来源"))
         title = str(item.get("title", "未命名片段"))
         content = str(item.get("content", "")).strip()
+        category = str(item.get("category", ""))
+        doc_type = str(item.get("doc_type", ""))
         if not content:
             continue
         combined = _to_hybrid_score(0.0, keyword_score)
         key = _candidate_key(source, title, content)
-        merged[key] = RetrievedChunk(source=source, title=title, content=content, score=combined)
+        merged[key] = RetrievedChunk(
+            source=source,
+            title=title,
+            content=content,
+            score=combined,
+            category=category,
+            doc_type=doc_type,
+        )
 
     # Try using ChromaDB first
     if db_path.exists():
@@ -311,6 +332,8 @@ def search_policy(query: str, top_k: int = 3, kb_path: Optional[str | Path] = No
                     source = str(meta.get("source", "未知来源"))
                     title = str(meta.get("title", "未命名片段"))
                     content = str(meta.get("content", doc)).strip()
+                    category = str(meta.get("category", ""))
+                    doc_type = str(meta.get("doc_type", ""))
                     if not content:
                         continue
                     vector_score = 1.0 / (1.0 + float(distance))
@@ -324,6 +347,8 @@ def search_policy(query: str, top_k: int = 3, kb_path: Optional[str | Path] = No
                             title=title,
                             content=content,
                             score=combined,
+                            category=category,
+                            doc_type=doc_type,
                         )
             if merged:
                 ranked = sorted(merged.values(), key=lambda x: x.score, reverse=True)
@@ -350,6 +375,8 @@ def search_policy(query: str, top_k: int = 3, kb_path: Optional[str | Path] = No
             source = str(meta.get("source", "未知来源"))
             title = str(meta.get("title", "未命名片段"))
             content = str(meta.get("content", "")).strip()
+            category = str(meta.get("category", ""))
+            doc_type = str(meta.get("doc_type", ""))
             if not content:
                 continue
             vector_score = float(sims[idx])
@@ -363,6 +390,8 @@ def search_policy(query: str, top_k: int = 3, kb_path: Optional[str | Path] = No
                     title=title,
                     content=content,
                     score=combined,
+                    category=category,
+                    doc_type=doc_type,
                 )
 
         if merged:

@@ -1,0 +1,44 @@
+{
+  "task_name": "财务报销自动填表",
+  "scenarios": [
+    "学生日常活动报销",
+    "社会实践差旅报销",
+    "实验材料采购报销",
+    "会议工作餐报销"
+  ],
+  "fields": [
+    {
+      "name": "报销人",
+      "type": "string",
+      "candidates": ["张三", "李四", "王五", "赵六"]
+    },
+    {
+      "name": "项目号",
+      "type": "string",
+      "candidates": ["PJ-2026-001", "PJ-2026-002", "PJ-2026-003"]
+    },
+    {
+      "name": "报销金额",
+      "type": "amount"
+    },
+    {
+      "name": "发生日期",
+      "type": "date"
+    },
+    {
+      "name": "票据类型",
+      "type": "string",
+      "candidates": ["电子发票", "纸质发票", "行程单", "支付凭证"]
+    },
+    {
+      "name": "是否有活动说明",
+      "type": "boolean"
+    }
+  ],
+  "constraints": [
+    "输出仅包含模板字段",
+    "金额保留两位小数",
+    "日期格式为 YYYY-MM-DD",
+    "缺失字段填 null"
+  ]
+}

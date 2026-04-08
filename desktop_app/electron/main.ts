@@ -8,7 +8,10 @@ import chokidar, { type FSWatcher } from "chokidar";
 import dotenv from "dotenv";
 import { app, BrowserWindow, dialog, ipcMain, screen, shell } from "electron";
 import type { OpenDialogOptions } from "electron";
+import * as XLSX from "xlsx";
 
+import type { EditTraceQuery } from "./editTrace";
+import { EditTraceStore } from "./editTrace";
 import { parseTemplate } from "./templateParser";
 
 dotenv.config({ path: path.join(process.cwd(), ".env") });
@@ -16,6 +19,7 @@ dotenv.config({ path: path.join(process.cwd(), ".env") });
 let mainWindow: BrowserWindow | null = null;
 let petWindow: BrowserWindow | null = null;
 let petChatWindow: BrowserWindow | null = null;
+let compareWindow: BrowserWindow | null = null;
 type SharedChatMessage = { role: string; content: string; status?: string };
 type ChatSession = {
   id: string;
@@ -32,8 +36,10 @@ let activeChatSessionId: string | null = null;
 let watcher: FSWatcher | null = null;
 let currentFilePath: string | null = null;
 const activeChatProcesses = new Map<string, ReturnType<typeof spawn>>();
+const editTraceStore = new EditTraceStore();
 let isQuitting = false;
 let petWorkspaceDir: string | null = null;
+let compareBoundDir: string | null = null;
 let petDragState: { startMouseX: number; startMouseY: number; startWindowX: number; startWindowY: number } | null = null;
 
 const isDev = !app.isPackaged;
@@ -724,6 +730,21 @@ function normalizeWorkspaceDir(candidatePath: string): string | null {
   }
 }
 
+function normalizeExcelCellValue(raw: string): string | number | boolean {
+  const text = String(raw ?? "");
+  const trimmed = text.trim();
+  if (trimmed === "") {
+    return "";
+  }
+  if (/^(true|false)$/i.test(trimmed)) {
+    return trimmed.toLowerCase() === "true";
+  }
+  if (/^[+-]?(\d+(\.\d+)?|\.\d+)$/.test(trimmed)) {
+    return Number(trimmed);
+  }
+  return text;
+}
+
 function showOrCreateMainWindow(): void {
   if (!mainWindow || mainWindow.isDestroyed()) {
     createMainWindow();
@@ -736,6 +757,138 @@ function showOrCreateMainWindow(): void {
     mainWindow.show();
   }
   mainWindow.focus();
+}
+
+function createCompareWindow(): void {
+  if (compareWindow && !compareWindow.isDestroyed()) {
+    if (compareWindow.isMinimized()) {
+      compareWindow.restore();
+    }
+    if (!compareWindow.isVisible()) {
+      compareWindow.show();
+    }
+    compareWindow.focus();
+    return;
+  }
+
+  compareWindow = new BrowserWindow({
+    width: 1480,
+    height: 920,
+    show: true,
+    webPreferences: {
+      preload: path.join(__dirname, "preload.js"),
+      contextIsolation: true,
+      nodeIntegration: false,
+    },
+  });
+  compareWindow.setMenu(null);
+  loadRendererRoute(compareWindow, "/compare");
+  compareWindow.on("closed", () => {
+    compareWindow = null;
+  });
+}
+
+type CompareFileEntry = {
+  path: string;
+  name: string;
+  ext: string;
+  size: number;
+  updatedAt: string;
+};
+
+function compareFileExtSupported(ext: string): boolean {
+  return (
+    ext === ".xlsx" ||
+    ext === ".xls" ||
+    ext === ".docx" ||
+    ext === ".doc" ||
+    ext === ".pdf"
+  );
+}
+
+function listComparableFilesInDir(rootDir: string): CompareFileEntry[] {
+  const files: CompareFileEntry[] = [];
+  const stack: Array<{ dir: string; depth: number }> = [{ dir: rootDir, depth: 0 }];
+  const maxDepth = 5;
+  const maxCount = 3000;
+
+  while (stack.length > 0 && files.length < maxCount) {
+    const current = stack.pop();
+    if (!current) {
+      break;
+    }
+    let entries: fs.Dirent[] = [];
+    try {
+      entries = fs.readdirSync(current.dir, { withFileTypes: true });
+    } catch {
+      continue;
+    }
+
+    for (const entry of entries) {
+      const fullPath = path.join(current.dir, entry.name);
+      if (entry.isDirectory()) {
+        if (current.depth < maxDepth) {
+          stack.push({ dir: fullPath, depth: current.depth + 1 });
+        }
+        continue;
+      }
+      if (!entry.isFile()) {
+        continue;
+      }
+
+      const ext = path.extname(entry.name).toLowerCase();
+      if (!compareFileExtSupported(ext)) {
+        continue;
+      }
+      try {
+        const stat = fs.statSync(fullPath);
+        files.push({
+          path: fullPath,
+          name: entry.name,
+          ext,
+          size: stat.size,
+          updatedAt: stat.mtime.toISOString(),
+        });
+      } catch {
+        // ignore one file stat failure and continue scanning
+      }
+    }
+  }
+
+  return files.sort((a, b) => {
+    const updatedDiff = Date.parse(b.updatedAt) - Date.parse(a.updatedAt);
+    if (updatedDiff !== 0) {
+      return updatedDiff;
+    }
+    return a.name.localeCompare(b.name, "zh-Hans-CN");
+  });
+}
+
+function resolveDefaultBoundDir(): string | null {
+  const projectRoot = isDev ? path.join(app.getAppPath(), "..") : path.join(app.getAppPath(), "..", "..");
+  try {
+    const stat = fs.statSync(projectRoot);
+    if (stat.isDirectory()) {
+      return projectRoot;
+    }
+  } catch {
+    // ignore
+  }
+  return null;
+}
+
+function ensureCompareBoundDir(): string | null {
+  if (compareBoundDir) {
+    try {
+      if (fs.statSync(compareBoundDir).isDirectory()) {
+        return compareBoundDir;
+      }
+    } catch {
+      compareBoundDir = null;
+    }
+  }
+  compareBoundDir = resolveDefaultBoundDir();
+  return compareBoundDir;
 }
 
 function createPetWindow(): void {
@@ -1008,6 +1161,384 @@ ipcMain.handle("template:readFile", async (_event, targetPath: string) => {
   }
 });
 
+ipcMain.handle(
+  "template:writeFile",
+  async (_event, payload: { targetPath: string; content: string }) => {
+    const filePath = String(payload?.targetPath ?? "");
+    if (!filePath) {
+      return { ok: false, error: "文件路径不能为空" };
+    }
+    if (!fs.existsSync(filePath)) {
+      return { ok: false, error: "文件不存在" };
+    }
+    try {
+      const content = String(payload?.content ?? "");
+      await editTraceStore.recordMutation({
+        operation: "write_file",
+        targetPath: filePath,
+        meta: {
+          contentLength: content.length,
+        },
+        run: () => {
+          const stat = fs.statSync(filePath);
+          if (!stat.isFile()) {
+            throw new Error("目标不是文件");
+          }
+          fs.writeFileSync(filePath, content, "utf-8");
+        },
+      });
+      const updated = fs.statSync(filePath);
+      return {
+        ok: true,
+        filePath,
+        updatedAt: updated.mtime.toISOString(),
+      };
+    } catch (err) {
+      return { ok: false, error: err instanceof Error ? err.message : String(err) };
+    }
+  }
+);
+
+ipcMain.handle(
+  "template:updateExcelCell",
+  async (
+    _event,
+    payload: {
+      targetPath: string;
+      sheetName: string;
+      rowIndex: number;
+      colIndex: number;
+      value: string;
+    }
+  ) => {
+    const filePath = String(payload?.targetPath ?? "");
+    if (!filePath) {
+      return { ok: false, error: "文件路径不能为空" };
+    }
+    if (!fs.existsSync(filePath)) {
+      return { ok: false, error: "文件不存在" };
+    }
+    const ext = path.extname(filePath).toLowerCase();
+    if (ext !== ".xlsx" && ext !== ".xls") {
+      return { ok: false, error: "仅支持编辑 xlsx/xls 文件" };
+    }
+    try {
+      await editTraceStore.recordMutation({
+        operation: "update_excel_cell",
+        targetPath: filePath,
+        meta: {
+          sheetName: payload.sheetName,
+          rowIndex: payload.rowIndex,
+          colIndex: payload.colIndex,
+        },
+        run: () => {
+          const workbook = XLSX.readFile(filePath, { cellDates: true });
+          const fallbackSheetName = workbook.SheetNames[0];
+          if (!fallbackSheetName) {
+            throw new Error("工作簿无可用工作表");
+          }
+          const sheetName = workbook.SheetNames.includes(payload.sheetName)
+            ? payload.sheetName
+            : fallbackSheetName;
+          const worksheet = workbook.Sheets[sheetName];
+          if (!worksheet) {
+            throw new Error("工作表不存在");
+          }
+
+          const rowIndex = Math.max(0, Number(payload.rowIndex) || 0);
+          const colIndex = Math.max(0, Number(payload.colIndex) || 0);
+          const cellAddress = XLSX.utils.encode_cell({ r: rowIndex, c: colIndex });
+          const nextValue = normalizeExcelCellValue(payload.value);
+
+          worksheet[cellAddress] = {
+            t: typeof nextValue === "number" ? "n" : typeof nextValue === "boolean" ? "b" : "s",
+            v: nextValue as XLSX.CellObject["v"],
+          };
+
+          const existingRef = String(worksheet["!ref"] ?? "").trim();
+          if (!existingRef) {
+            worksheet["!ref"] = `${cellAddress}:${cellAddress}`;
+          } else {
+            const range = XLSX.utils.decode_range(existingRef);
+            range.s.r = Math.min(range.s.r, rowIndex);
+            range.s.c = Math.min(range.s.c, colIndex);
+            range.e.r = Math.max(range.e.r, rowIndex);
+            range.e.c = Math.max(range.e.c, colIndex);
+            worksheet["!ref"] = XLSX.utils.encode_range(range);
+          }
+
+          XLSX.writeFile(workbook, filePath);
+        },
+      });
+      const updated = fs.statSync(filePath);
+      return { ok: true, updatedAt: updated.mtime.toISOString() };
+    } catch (err) {
+      return { ok: false, error: err instanceof Error ? err.message : String(err) };
+    }
+  }
+);
+
+ipcMain.handle(
+  "template:updateExcelRange",
+  async (
+    _event,
+    payload: {
+      targetPath: string;
+      sheetName: string;
+      startRowIndex: number;
+      startColIndex: number;
+      values: string[][];
+    }
+  ) => {
+    const filePath = String(payload?.targetPath ?? "");
+    if (!filePath) {
+      return { ok: false, error: "文件路径不能为空" };
+    }
+    if (!fs.existsSync(filePath)) {
+      return { ok: false, error: "文件不存在" };
+    }
+    const ext = path.extname(filePath).toLowerCase();
+    if (ext !== ".xlsx" && ext !== ".xls") {
+      return { ok: false, error: "仅支持编辑 xlsx/xls 文件" };
+    }
+    try {
+      const matrix = Array.isArray(payload.values)
+        ? payload.values
+            .map((row) => (Array.isArray(row) ? row.map((cell) => String(cell ?? "")) : []))
+            .filter((row) => row.length > 0)
+        : [];
+      if (matrix.length === 0) {
+        return { ok: false, error: "粘贴内容为空" };
+      }
+      await editTraceStore.recordMutation({
+        operation: "update_excel_range",
+        targetPath: filePath,
+        meta: {
+          sheetName: payload.sheetName,
+          startRowIndex: payload.startRowIndex,
+          startColIndex: payload.startColIndex,
+          rowCount: matrix.length,
+          colCount: matrix[0]?.length ?? 0,
+        },
+        run: () => {
+          const workbook = XLSX.readFile(filePath, { cellDates: true });
+          const fallbackSheetName = workbook.SheetNames[0];
+          if (!fallbackSheetName) {
+            throw new Error("工作簿无可用工作表");
+          }
+          const sheetName = workbook.SheetNames.includes(payload.sheetName)
+            ? payload.sheetName
+            : fallbackSheetName;
+          const worksheet = workbook.Sheets[sheetName];
+          if (!worksheet) {
+            throw new Error("工作表不存在");
+          }
+
+          const startRow = Math.max(0, Number(payload.startRowIndex) || 0);
+          const startCol = Math.max(0, Number(payload.startColIndex) || 0);
+          let maxRow = startRow;
+          let maxCol = startCol;
+
+          for (let rowOffset = 0; rowOffset < matrix.length; rowOffset += 1) {
+            const row = matrix[rowOffset];
+            for (let colOffset = 0; colOffset < row.length; colOffset += 1) {
+              const rowIndex = startRow + rowOffset;
+              const colIndex = startCol + colOffset;
+              const cellAddress = XLSX.utils.encode_cell({ r: rowIndex, c: colIndex });
+              const nextValue = normalizeExcelCellValue(row[colOffset]);
+              worksheet[cellAddress] = {
+                t: typeof nextValue === "number" ? "n" : typeof nextValue === "boolean" ? "b" : "s",
+                v: nextValue as XLSX.CellObject["v"],
+              };
+              maxRow = Math.max(maxRow, rowIndex);
+              maxCol = Math.max(maxCol, colIndex);
+            }
+          }
+
+          const existingRef = String(worksheet["!ref"] ?? "").trim();
+          if (!existingRef) {
+            worksheet["!ref"] = XLSX.utils.encode_range({
+              s: { r: startRow, c: startCol },
+              e: { r: maxRow, c: maxCol },
+            });
+          } else {
+            const range = XLSX.utils.decode_range(existingRef);
+            range.s.r = Math.min(range.s.r, startRow);
+            range.s.c = Math.min(range.s.c, startCol);
+            range.e.r = Math.max(range.e.r, maxRow);
+            range.e.c = Math.max(range.e.c, maxCol);
+            worksheet["!ref"] = XLSX.utils.encode_range(range);
+          }
+
+          XLSX.writeFile(workbook, filePath);
+        },
+      });
+      const updated = fs.statSync(filePath);
+      return { ok: true, updatedAt: updated.mtime.toISOString() };
+    } catch (err) {
+      return { ok: false, error: err instanceof Error ? err.message : String(err) };
+    }
+  }
+);
+
+ipcMain.handle(
+  "template:appendExcelRows",
+  async (
+    _event,
+    payload: {
+      targetPath: string;
+      sheetName: string;
+      count: number;
+    }
+  ) => {
+    const filePath = String(payload?.targetPath ?? "");
+    if (!filePath) {
+      return { ok: false, error: "文件路径不能为空" };
+    }
+    if (!fs.existsSync(filePath)) {
+      return { ok: false, error: "文件不存在" };
+    }
+    const ext = path.extname(filePath).toLowerCase();
+    if (ext !== ".xlsx" && ext !== ".xls") {
+      return { ok: false, error: "仅支持编辑 xlsx/xls 文件" };
+    }
+    try {
+      await editTraceStore.recordMutation({
+        operation: "append_excel_rows",
+        targetPath: filePath,
+        meta: {
+          sheetName: payload.sheetName,
+          count: payload.count,
+        },
+        run: () => {
+          const workbook = XLSX.readFile(filePath, { cellDates: true });
+          const fallbackSheetName = workbook.SheetNames[0];
+          if (!fallbackSheetName) {
+            throw new Error("工作簿无可用工作表");
+          }
+          const sheetName = workbook.SheetNames.includes(payload.sheetName)
+            ? payload.sheetName
+            : fallbackSheetName;
+          const worksheet = workbook.Sheets[sheetName];
+          if (!worksheet) {
+            throw new Error("工作表不存在");
+          }
+          const count = Math.max(1, Math.min(200, Number(payload.count) || 1));
+          const existingRef = String(worksheet["!ref"] ?? "").trim();
+          if (!existingRef) {
+            const endRow = Math.max(0, count - 1);
+            worksheet["!ref"] = XLSX.utils.encode_range({
+              s: { r: 0, c: 0 },
+              e: { r: endRow, c: 0 },
+            });
+          } else {
+            const range = XLSX.utils.decode_range(existingRef);
+            range.e.r += count;
+            worksheet["!ref"] = XLSX.utils.encode_range(range);
+          }
+
+          XLSX.writeFile(workbook, filePath);
+        },
+      });
+      const updated = fs.statSync(filePath);
+      return { ok: true, updatedAt: updated.mtime.toISOString() };
+    } catch (err) {
+      return { ok: false, error: err instanceof Error ? err.message : String(err) };
+    }
+  }
+);
+
+ipcMain.handle(
+  "template:trimExcelSheet",
+  async (
+    _event,
+    payload: {
+      targetPath: string;
+      sheetName: string;
+      axis: "row" | "col";
+      count: number;
+    }
+  ) => {
+    const filePath = String(payload?.targetPath ?? "");
+    if (!filePath) {
+      return { ok: false, error: "文件路径不能为空" };
+    }
+    if (!fs.existsSync(filePath)) {
+      return { ok: false, error: "文件不存在" };
+    }
+    const ext = path.extname(filePath).toLowerCase();
+    if (ext !== ".xlsx" && ext !== ".xls") {
+      return { ok: false, error: "仅支持编辑 xlsx/xls 文件" };
+    }
+    try {
+      await editTraceStore.recordMutation({
+        operation: "trim_excel_sheet",
+        targetPath: filePath,
+        meta: {
+          sheetName: payload.sheetName,
+          axis: payload.axis,
+          count: payload.count,
+        },
+        run: () => {
+          const workbook = XLSX.readFile(filePath, { cellDates: true });
+          const fallbackSheetName = workbook.SheetNames[0];
+          if (!fallbackSheetName) {
+            throw new Error("工作簿无可用工作表");
+          }
+          const sheetName = workbook.SheetNames.includes(payload.sheetName)
+            ? payload.sheetName
+            : fallbackSheetName;
+          const worksheet = workbook.Sheets[sheetName];
+          if (!worksheet) {
+            throw new Error("工作表不存在");
+          }
+          const existingRef = String(worksheet["!ref"] ?? "").trim();
+          if (!existingRef) {
+            throw new Error("工作表为空，无法删除");
+          }
+          const range = XLSX.utils.decode_range(existingRef);
+          const count = Math.max(1, Math.min(200, Number(payload.count) || 1));
+
+          if (payload.axis === "row") {
+            const oldEndRow = range.e.r;
+            const newEndRow = Math.max(range.s.r, oldEndRow - count);
+            if (newEndRow === oldEndRow) {
+              throw new Error("已无法继续删除末行");
+            }
+            for (let r = newEndRow + 1; r <= oldEndRow; r += 1) {
+              for (let c = range.s.c; c <= range.e.c; c += 1) {
+                const addr = XLSX.utils.encode_cell({ r, c });
+                delete worksheet[addr];
+              }
+            }
+            range.e.r = newEndRow;
+          } else {
+            const oldEndCol = range.e.c;
+            const newEndCol = Math.max(range.s.c, oldEndCol - count);
+            if (newEndCol === oldEndCol) {
+              throw new Error("已无法继续删除末列");
+            }
+            for (let c = newEndCol + 1; c <= oldEndCol; c += 1) {
+              for (let r = range.s.r; r <= range.e.r; r += 1) {
+                const addr = XLSX.utils.encode_cell({ r, c });
+                delete worksheet[addr];
+              }
+            }
+            range.e.c = newEndCol;
+          }
+
+          worksheet["!ref"] = XLSX.utils.encode_range(range);
+          XLSX.writeFile(workbook, filePath);
+        },
+      });
+      const updated = fs.statSync(filePath);
+      return { ok: true, updatedAt: updated.mtime.toISOString() };
+    } catch (err) {
+      return { ok: false, error: err instanceof Error ? err.message : String(err) };
+    }
+  }
+);
+
 ipcMain.handle("template:preview", async (_event, filePath: string) => {
   currentFilePath = filePath;
   setupWatcher(filePath);
@@ -1020,6 +1551,183 @@ ipcMain.handle("template:unwatch", async () => {
     watcher = null;
   }
   currentFilePath = null;
+});
+
+ipcMain.handle("trace:list", async (_event, query?: string | EditTraceQuery) => {
+  if (typeof query === "string") {
+    const normalizedPath = String(query).trim();
+    return editTraceStore.list({ targetPath: normalizedPath || undefined });
+  }
+  return editTraceStore.list(query);
+});
+
+ipcMain.handle("trace:get", async (_event, eventId: string) => {
+  const id = String(eventId ?? "").trim();
+  if (!id) {
+    return null;
+  }
+  return editTraceStore.get(id);
+});
+
+ipcMain.handle("trace:replay", async (_event, eventId: string) => {
+  const id = String(eventId ?? "").trim();
+  if (!id) {
+    return { ok: false, error: "事件ID不能为空" };
+  }
+  const event = editTraceStore.get(id);
+  if (!event) {
+    return { ok: false, error: "事件不存在" };
+  }
+  if (!event.replayText) {
+    return { ok: false, error: "当前事件不支持文本回放" };
+  }
+  return {
+    ok: true,
+    targetPath: event.targetPath,
+    content: event.replayText,
+    timestamp: event.timestamp,
+  };
+});
+
+ipcMain.handle("trace:clear", async () => {
+  editTraceStore.clear();
+  return { ok: true };
+});
+
+ipcMain.handle("compare:openWindow", async () => {
+  createCompareWindow();
+  return { ok: true };
+});
+
+ipcMain.handle("compare:getBoundDir", async () => {
+  return ensureCompareBoundDir();
+});
+
+ipcMain.handle("compare:setBoundDir", async (_event, targetDir: string) => {
+  const dirPath = String(targetDir ?? "").trim();
+  if (!dirPath) {
+    return { ok: false, error: "目录不能为空" };
+  }
+  try {
+    const stat = fs.statSync(dirPath);
+    if (!stat.isDirectory()) {
+      return { ok: false, error: "目标不是目录" };
+    }
+    compareBoundDir = path.resolve(dirPath);
+    return { ok: true, dir: compareBoundDir };
+  } catch (err) {
+    return { ok: false, error: err instanceof Error ? err.message : String(err) };
+  }
+});
+
+ipcMain.handle("compare:pickBoundDir", async () => {
+  const parent = getDialogParentWindow(compareWindow, mainWindow);
+  const options: OpenDialogOptions = {
+    title: "选择已绑定目录",
+    properties: ["openDirectory"],
+  };
+  const result = parent ? await dialog.showOpenDialog(parent, options) : await dialog.showOpenDialog(options);
+  if (result.canceled || result.filePaths.length === 0) {
+    return { ok: false, message: "已取消" };
+  }
+  const selected = result.filePaths[0];
+  try {
+    const stat = fs.statSync(selected);
+    if (!stat.isDirectory()) {
+      return { ok: false, error: "目标不是目录" };
+    }
+    compareBoundDir = path.resolve(selected);
+    return { ok: true, dir: compareBoundDir };
+  } catch (err) {
+    return { ok: false, error: err instanceof Error ? err.message : String(err) };
+  }
+});
+
+ipcMain.handle("compare:listBoundFiles", async () => {
+  const boundDir = ensureCompareBoundDir();
+  if (!boundDir) {
+    return { ok: false, error: "尚未绑定目录" };
+  }
+  try {
+    const files = listComparableFilesInDir(boundDir);
+    return { ok: true, dir: boundDir, files };
+  } catch (err) {
+    return { ok: false, error: err instanceof Error ? err.message : String(err) };
+  }
+});
+
+ipcMain.handle("compare:pickFile", async (_event, payload?: { role?: "final" | "budget" }) => {
+  const role = payload?.role === "final" ? "决算表" : payload?.role === "budget" ? "预算表" : "文件";
+  const parent = getDialogParentWindow(compareWindow, mainWindow);
+  const options: OpenDialogOptions = {
+    title: `上传${role}`,
+    properties: ["openFile"],
+    filters: [
+      { name: "可预览文件", extensions: ["xlsx", "xls", "docx", "doc", "pdf"] },
+      { name: "All Files", extensions: ["*"] },
+    ],
+  };
+  const result = parent ? await dialog.showOpenDialog(parent, options) : await dialog.showOpenDialog(options);
+  if (result.canceled || result.filePaths.length === 0) {
+    return { ok: false, message: "已取消" };
+  }
+  return { ok: true, path: result.filePaths[0] };
+});
+
+ipcMain.handle("compare:previewTemplate", async (_event, filePath: string) => {
+  const targetPath = String(filePath ?? "").trim();
+  if (!targetPath) {
+    return { ok: false, error: "文件路径不能为空" };
+  }
+  if (!fs.existsSync(targetPath)) {
+    return { ok: false, error: "文件不存在" };
+  }
+  try {
+    const preview = await parseTemplate(targetPath);
+    return { ok: true, preview };
+  } catch (err) {
+    return { ok: false, error: err instanceof Error ? err.message : String(err) };
+  }
+});
+
+ipcMain.handle("trace:summary", async (_event, query?: string | EditTraceQuery) => {
+  if (typeof query === "string") {
+    const normalizedPath = String(query).trim();
+    return editTraceStore.summary({ targetPath: normalizedPath || undefined });
+  }
+  return editTraceStore.summary(query);
+});
+
+ipcMain.handle("trace:export", async (_event, query?: string | EditTraceQuery) => {
+  const parent = getDialogParentWindow(mainWindow);
+  const selectedQuery: EditTraceQuery =
+    typeof query === "string"
+      ? { targetPath: String(query).trim() || undefined }
+      : query ?? {};
+  const list = editTraceStore.list(selectedQuery);
+  const summary = editTraceStore.summary(selectedQuery);
+  const payload = {
+    exportedAt: new Date().toISOString(),
+    query: selectedQuery,
+    summary,
+    events: list,
+  };
+  const result = parent
+    ? await dialog.showSaveDialog(parent, {
+        title: "导出编辑轨迹",
+        defaultPath: `edit-trace-${Date.now()}.json`,
+        filters: [{ name: "JSON", extensions: ["json"] }],
+      })
+    : await dialog.showSaveDialog({
+        title: "导出编辑轨迹",
+        defaultPath: `edit-trace-${Date.now()}.json`,
+        filters: [{ name: "JSON", extensions: ["json"] }],
+      });
+  if (result.canceled || !result.filePath) {
+    return { ok: false, message: "已取消导出" };
+  }
+  fs.writeFileSync(result.filePath, JSON.stringify(payload, null, 2), "utf-8");
+  return { ok: true, filePath: result.filePath, count: list.length };
 });
 
 ipcMain.handle("agent:chat", async (_event, request: { message: string; payload?: unknown }) => {

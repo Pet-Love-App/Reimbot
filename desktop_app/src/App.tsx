@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { Alert, Button, Card, Input, Select, Space, Typography } from "antd";
 import { FileOutlined, FolderOpenOutlined, FolderOutlined } from "@ant-design/icons";
 
@@ -6,6 +6,13 @@ import { PreviewPanel } from "./components/PreviewPanel";
 import { MarkdownRenderer } from "./components/MarkdownRenderer";
 import type { AgentChatResponse, AgentChatStreamEvent, ChatMessage } from "./types/chat";
 import type { FilePreview } from "./types/preview";
+import type {
+  EditTraceEvent,
+  EditTraceEventDetail,
+  EditTraceQuery,
+  EditTraceSummary,
+  TraceOperation,
+} from "./types/trace";
 import { useThemeMode } from "./theme";
 
 type TaskType = "qa" | "reimburse" | "final_account" | "budget";
@@ -49,6 +56,18 @@ const TASK_META: Record<TaskType, { label: string; demo: string }> = {
   budget: { label: "预算生成", demo: "请生成下一年度预算" },
 };
 
+const TRACE_OPERATION_LABEL: Record<TraceOperation, string> = {
+  write_file: "文本写入",
+  update_excel_cell: "改单元格",
+  update_excel_range: "批量粘贴",
+  append_excel_rows: "追加行",
+  trim_excel_sheet: "删除行列",
+};
+
+const TRACE_OPERATION_OPTIONS: Array<{ label: string; value: TraceOperation }> = (
+  Object.keys(TRACE_OPERATION_LABEL) as TraceOperation[]
+).map((key) => ({ value: key, label: TRACE_OPERATION_LABEL[key] }));
+
 export default function App() {
   const bridge = window.templateApi;
   const bridgeReady = Boolean(bridge);
@@ -71,6 +90,21 @@ export default function App() {
   const [loadingPaths, setLoadingPaths] = useState<string[]>([]);
   const [treeLoading, setTreeLoading] = useState(false);
   const treeRefreshInFlightRef = useRef(false);
+  const saveTimerRef = useRef<number | null>(null);
+
+  const [editorContent, setEditorContent] = useState("");
+  const [editorDirty, setEditorDirty] = useState(false);
+  const [editorSaving, setEditorSaving] = useState(false);
+  const [editorError, setEditorError] = useState<string | null>(null);
+  const [editorAutoSave, setEditorAutoSave] = useState(true);
+  const [editorLastSavedAt, setEditorLastSavedAt] = useState<string | null>(null);
+  const [traceEvents, setTraceEvents] = useState<EditTraceEvent[]>([]);
+  const [traceFilterPath, setTraceFilterPath] = useState("");
+  const [traceStatusFilter, setTraceStatusFilter] = useState<"all" | "ok" | "failed">("all");
+  const [traceOperationFilter, setTraceOperationFilter] = useState<TraceOperation[]>([]);
+  const [traceLoading, setTraceLoading] = useState(false);
+  const [traceDetail, setTraceDetail] = useState<EditTraceEventDetail | null>(null);
+  const [traceSummary, setTraceSummary] = useState<EditTraceSummary | null>(null);
 
   const appRef = useRef<HTMLDivElement>(null);
   const contentRef = useRef<HTMLDivElement>(null);
@@ -176,6 +210,60 @@ export default function App() {
       bridge.unwatchTemplate().catch(() => undefined);
     };
   }, [bridge]);
+
+  useEffect(() => {
+    if (!preview || preview.kind !== "text") {
+      setEditorContent("");
+      setEditorDirty(false);
+      setEditorError(null);
+      setEditorLastSavedAt(null);
+      return;
+    }
+    setEditorContent(preview.content);
+    setEditorDirty(false);
+    setEditorError(null);
+    setEditorLastSavedAt(preview.updatedAt);
+  }, [preview]);
+
+  const traceQuery = useMemo<EditTraceQuery>(() => {
+    const normalizedPath = traceFilterPath.trim();
+    return {
+      targetPath: normalizedPath || undefined,
+      operations: traceOperationFilter.length > 0 ? traceOperationFilter : undefined,
+      status: traceStatusFilter === "all" ? undefined : traceStatusFilter,
+    };
+  }, [traceFilterPath, traceOperationFilter, traceStatusFilter]);
+
+  const refreshTraceEvents = async (query?: EditTraceQuery) => {
+    if (!bridge || typeof (bridge as any).listEditTrace !== "function") {
+      return;
+    }
+    setTraceLoading(true);
+    try {
+      const usedQuery = query ?? traceQuery;
+      const [events, summary] = await Promise.all([
+        ((await (bridge as any).listEditTrace(usedQuery)) ?? []) as EditTraceEvent[],
+        typeof (bridge as any).getEditTraceSummary === "function"
+          ? ((await (bridge as any).getEditTraceSummary(usedQuery)) as EditTraceSummary)
+          : null,
+      ]);
+      setTraceEvents(Array.isArray(events) ? events : []);
+      setTraceSummary(summary);
+    } finally {
+      setTraceLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    if (!bridge || typeof (bridge as any).listEditTrace !== "function") {
+      return;
+    }
+    void refreshTraceEvents(traceQuery);
+    const timer = window.setInterval(() => {
+      void refreshTraceEvents(traceQuery);
+    }, 2000);
+    return () => window.clearInterval(timer);
+  }, [bridge, traceQuery]);
 
   useEffect(() => {
     if (!bridge || typeof bridge.getProjectDir !== "function" || typeof bridge.listDir !== "function") {
@@ -585,7 +673,25 @@ export default function App() {
     if (task === "qa") {
       const answer = String(taskResult.answer ?? "");
       const citations = Array.isArray(taskResult.citations) ? taskResult.citations.length : 0;
-      return `\n\n### 任务结果\n- 任务类型: ${TASK_META[task].label}\n- 引用条目: ${citations}\n\n${answer}`;
+      const retrieval = String(taskResult.retrieval ?? "");
+      const confidenceRaw = Number(taskResult.confidence ?? 0);
+      const confidence = Number.isFinite(confidenceRaw) ? confidenceRaw : 0;
+      const needsClarification = Boolean(taskResult.needs_clarification);
+      const clarifyingQuestion = String(taskResult.clarifying_question ?? "");
+      const itemsCountRaw = Number(taskResult.items_count ?? 0);
+      const itemsCount = Number.isFinite(itemsCountRaw) ? itemsCountRaw : 0;
+
+      let lines =
+        `\n\n### 任务结果\n- 任务类型: ${TASK_META[task].label}` +
+        `\n- 引用条目: ${citations}` +
+        `\n- 检索模式: ${retrieval || "unknown"}` +
+        `\n- 候选条目: ${itemsCount}` +
+        `\n- 置信度: ${confidence.toFixed(2)}` +
+        `\n- 需要补充信息: ${needsClarification ? "是" : "否"}`;
+      if (needsClarification && clarifyingQuestion) {
+        lines += `\n- 澄清问题: ${clarifyingQuestion}`;
+      }
+      return `${lines}\n\n${answer}`;
     }
 
     if (task === "reimburse") {
@@ -651,6 +757,76 @@ export default function App() {
 
   const clearChatMessages = () => {
     setMessages([DEFAULT_CHAT_MESSAGE]);
+  };
+
+  const formatTraceTime = (iso: string): string => {
+    return new Date(iso).toLocaleTimeString();
+  };
+
+  const formatBytes = (size: number): string => {
+    if (size < 1024) return `${size} B`;
+    if (size < 1024 * 1024) return `${(size / 1024).toFixed(1)} KB`;
+    return `${(size / (1024 * 1024)).toFixed(2)} MB`;
+  };
+
+  const handleSelectTraceEvent = async (eventId: string) => {
+    if (!bridge || typeof (bridge as any).getEditTrace !== "function") {
+      return;
+    }
+    const detail = (await (bridge as any).getEditTrace(eventId)) as EditTraceEventDetail | null;
+    setTraceDetail(detail);
+  };
+
+  const handleReplayTraceEvent = async (eventId: string) => {
+    if (!bridge || typeof (bridge as any).replayEditTrace !== "function") {
+      return;
+    }
+    const result = await (bridge as any).replayEditTrace(eventId);
+    if (!result?.ok) {
+      setError(result?.error || "回放失败");
+      return;
+    }
+    const targetPath = String(result.targetPath ?? "");
+    const replayContent = String(result.content ?? "");
+    if (!targetPath) {
+      return;
+    }
+    setCurrentFile(targetPath);
+    setPreview({
+      kind: "text",
+      filePath: targetPath,
+      fileType: targetPath.split(".").pop() || "txt",
+      updatedAt: String(result.timestamp || new Date().toISOString()),
+      content: replayContent,
+      truncated: false,
+    });
+    setEditorContent(replayContent);
+    setEditorDirty(false);
+    setEditorError(null);
+  };
+
+  const handleClearTraceEvents = async () => {
+    if (!bridge || typeof (bridge as any).clearEditTrace !== "function") {
+      return;
+    }
+    await (bridge as any).clearEditTrace();
+    setTraceDetail(null);
+    setTraceEvents([]);
+    setTraceSummary(null);
+  };
+
+  const handleExportTraceEvents = async () => {
+    if (!bridge || typeof (bridge as any).exportEditTrace !== "function") {
+      return;
+    }
+    const result = await (bridge as any).exportEditTrace(traceQuery);
+    if (!result?.ok) {
+      if (result?.message && result.message !== "已取消导出") {
+        setError(result.message);
+      }
+      return;
+    }
+    setError(null);
   };
 
   const buildFriendlyError = (input: unknown): { short: string; detail: string } => {
@@ -905,6 +1081,128 @@ export default function App() {
     }
   };
 
+  const persistEditedFile = async (nextContent: string) => {
+    if (!bridge || !currentFile || preview?.kind !== "text") return false;
+    if (editorSaving) return false;
+    setEditorSaving(true);
+    setEditorError(null);
+    try {
+      const writeResult = await bridge.writeFile(currentFile, nextContent);
+      if (!writeResult?.ok) {
+        setEditorError(writeResult?.error || "保存失败");
+        return false;
+      }
+      setEditorDirty(false);
+      setEditorLastSavedAt(writeResult.updatedAt || new Date().toISOString());
+      setPreview((prev) => {
+        if (!prev || prev.kind !== "text") return prev;
+        return {
+          ...prev,
+          content: nextContent,
+          updatedAt: writeResult.updatedAt || prev.updatedAt,
+        };
+      });
+      void refreshTraceEvents(traceQuery);
+      return true;
+    } catch (err) {
+      setEditorError(err instanceof Error ? err.message : String(err));
+      return false;
+    } finally {
+      setEditorSaving(false);
+    }
+  };
+
+  const updateExcelCell = async (
+    sheetName: string,
+    rowIndex: number,
+    colIndex: number,
+    value: string
+  ) => {
+    if (!bridge || !currentFile) return;
+    const result = await bridge.updateExcelCell(currentFile, sheetName, rowIndex, colIndex, value);
+    if (!result?.ok) {
+      setError(result?.error || "更新单元格失败");
+      return;
+    }
+    const snapshot = await bridge.getPreview(currentFile);
+    setPreview({ kind: "template", data: snapshot });
+    setError(null);
+    void refreshTraceEvents(traceQuery);
+  };
+
+  const updateExcelRange = async (
+    sheetName: string,
+    startRowIndex: number,
+    startColIndex: number,
+    values: string[][]
+  ) => {
+    if (!bridge || !currentFile) return;
+    const result = await bridge.updateExcelRange(
+      currentFile,
+      sheetName,
+      startRowIndex,
+      startColIndex,
+      values
+    );
+    if (!result?.ok) {
+      setError(result?.error || "批量粘贴失败");
+      return;
+    }
+    const snapshot = await bridge.getPreview(currentFile);
+    setPreview({ kind: "template", data: snapshot });
+    setError(null);
+    void refreshTraceEvents(traceQuery);
+  };
+
+  const appendExcelRows = async (sheetName: string, count: number) => {
+    if (!bridge || !currentFile) return;
+    const result = await bridge.appendExcelRows(currentFile, sheetName, count);
+    if (!result?.ok) {
+      setError(result?.error || "追加空行失败");
+      return;
+    }
+    const snapshot = await bridge.getPreview(currentFile);
+    setPreview({ kind: "template", data: snapshot });
+    setError(null);
+    void refreshTraceEvents(traceQuery);
+  };
+
+  const trimExcelSheet = async (sheetName: string, axis: "row" | "col", count: number) => {
+    if (!bridge || !currentFile) return;
+    const result = await bridge.trimExcelSheet(currentFile, sheetName, axis, count);
+    if (!result?.ok) {
+      setError(result?.error || "结构编辑失败");
+      return;
+    }
+    const snapshot = await bridge.getPreview(currentFile);
+    setPreview({ kind: "template", data: snapshot });
+    setError(null);
+    void refreshTraceEvents(traceQuery);
+  };
+
+  useEffect(() => {
+    if (!editorAutoSave || !editorDirty || preview?.kind !== "text") {
+      if (saveTimerRef.current !== null) {
+        window.clearTimeout(saveTimerRef.current);
+        saveTimerRef.current = null;
+      }
+      return;
+    }
+    if (saveTimerRef.current !== null) {
+      window.clearTimeout(saveTimerRef.current);
+    }
+    saveTimerRef.current = window.setTimeout(() => {
+      void persistEditedFile(editorContent);
+    }, 600);
+
+    return () => {
+      if (saveTimerRef.current !== null) {
+        window.clearTimeout(saveTimerRef.current);
+        saveTimerRef.current = null;
+      }
+    };
+  }, [editorAutoSave, editorDirty, editorContent, preview?.kind, currentFile]);
+
   const handlePreviewFile = async (filePath: string) => {
     if (!bridge) return;
     const lower = filePath.toLowerCase();
@@ -942,6 +1240,10 @@ export default function App() {
           content: response.content || "",
           truncated: response.truncated,
         });
+        setEditorContent(response.content || "");
+        setEditorDirty(false);
+        setEditorError(null);
+        setEditorLastSavedAt(response.updatedAt || new Date().toISOString());
       } else if (response.kind === "image") {
         setPreview({
           kind: "image",
@@ -974,17 +1276,57 @@ export default function App() {
     <div className="app-layout" ref={appRef}>
       <aside className="sidebar" style={{ flex: `0 0 ${sidebarWidthPx}px` }}>
         <Space direction="vertical" size="small" className="sidebar-header">
-          <Title level={4}>功能面板</Title>
-          <Paragraph>集中处理任务、查看输出并实时预览文件。</Paragraph>
-          <Space size="small" wrap>
-            <Button onClick={toggleMode} size="small">
-              {mode === "dark" ? "切换浅色" : "切换深色"}
+          <div className="sidebar-title-row">
+            <Title level={4}>功能面板</Title>
+            <Text className={`ready-pill ${bridgeReady ? "is-ready" : "is-warn"}`}>
+              {bridgeReady ? "连接正常" : "连接未就绪"}
+            </Text>
+          </div>
+          <Paragraph>按“文件准备 → 发起任务 → 查看结果”的流程操作，上手更快。</Paragraph>
+          <div className="sidebar-steps" aria-label="任务步骤">
+            <span className="sidebar-step is-active">1 选任务</span>
+            <span className="sidebar-step">2 发起任务</span>
+            <span className="sidebar-step">3 查看结果</span>
+          </div>
+          <Button
+            type="primary"
+            className="primary-action-btn"
+            onClick={() => void bridge?.openCompareWindow?.()}
+            disabled={!bridgeReady}
+          >
+            打开比对窗口
+          </Button>
+          <Space size="small" wrap className="sidebar-quick-actions">
+            <Button onClick={() => setInputText(getTaskDemoPrompt(selectedTask))} size="small" disabled={chatLoading || !bridgeReady}>
+              填入示例
             </Button>
             <Button onClick={clearChatMessages} size="small" disabled={chatLoading}>
               清空对话
             </Button>
+            <Button onClick={toggleMode} size="small">
+              {mode === "dark" ? "切换浅色" : "切换深色"}
+            </Button>
           </Space>
         </Space>
+
+        <Card size="small" className="status-block task-focus-card">
+          <div className="task-focus-header">
+            <Text strong>当前任务</Text>
+            <Select
+              size="small"
+              value={selectedTask}
+              onChange={(value) => setSelectedTask(value as TaskType)}
+              disabled={chatLoading || !bridgeReady}
+              options={[
+                { value: "qa", label: TASK_META.qa.label },
+                { value: "reimburse", label: TASK_META.reimburse.label },
+                { value: "final_account", label: TASK_META.final_account.label },
+                { value: "budget", label: TASK_META.budget.label },
+              ]}
+            />
+          </div>
+          <Text className="task-focus-hint">示例：{TASK_META[selectedTask].demo}</Text>
+        </Card>
 
         <Card size="small" className="status-block file-tree-card">
           <div className="file-tree-header">
@@ -1031,37 +1373,135 @@ export default function App() {
           </Card>
         )}
 
-        <Card size="small" className="status-block task-history-block">
-          <div className="task-history-header">
-            <Text strong>任务历史</Text>
-            <Button
-              size="small"
-              className="task-clear-btn"
-              onClick={clearTaskHistory}
-              disabled={taskHistory.length === 0}
-            >
-              清空
-            </Button>
-          </div>
-          <div className="task-history-list">
-            {taskHistory.length === 0 ? (
-              <Text className="task-output-empty">暂无任务记录</Text>
-            ) : (
-              taskHistory.map((item) => (
-                <div className="task-history-item" key={item.id}>
-                  <div className="task-history-top">
-                    <span className="task-history-type">{TASK_META[item.taskType].label}</span>
-                    <span className={`task-history-status ${item.status}`}>
-                      {item.status === "running" ? "运行中" : item.status === "success" ? "成功" : "失败"}
-                    </span>
-                  </div>
-                  <div className="task-history-input">{item.inputText || "(空输入)"}</div>
-                  {item.error ? <div className="task-history-error">{item.error}</div> : null}
-                </div>
-              ))
+        <details className="sidebar-advanced-block">
+          <summary>高级功能：编辑轨迹</summary>
+          <Card size="small" className="status-block trace-card">
+            <div className="task-history-header">
+              <Text strong>编辑轨迹</Text>
+              <Space size="small">
+                <Button
+                  size="small"
+                  onClick={() => void refreshTraceEvents(traceQuery)}
+                  disabled={!bridgeReady || traceLoading}
+                >
+                  刷新
+                </Button>
+                <Button
+                  size="small"
+                  onClick={() => void handleExportTraceEvents()}
+                  disabled={!bridgeReady || traceEvents.length === 0}
+                >
+                  导出
+                </Button>
+                <Button
+                  size="small"
+                  onClick={() => void handleClearTraceEvents()}
+                  disabled={!bridgeReady || traceEvents.length === 0}
+                >
+                  清空
+                </Button>
+              </Space>
+            </div>
+            {traceSummary && (
+              <div className="trace-summary">
+                <span>总计 {traceSummary.total}</span>
+                <span>成功 {traceSummary.ok}</span>
+                <span>失败 {traceSummary.failed}</span>
+              </div>
             )}
-          </div>
-        </Card>
+            <Input
+              size="small"
+              value={traceFilterPath}
+              onChange={(event) => setTraceFilterPath(event.target.value)}
+              placeholder="按文件路径筛选轨迹"
+            />
+            <Select
+              size="small"
+              value={traceStatusFilter}
+              onChange={(value) => setTraceStatusFilter(value as "all" | "ok" | "failed")}
+              options={[
+                { label: "全部状态", value: "all" },
+                { label: "仅成功", value: "ok" },
+                { label: "仅失败", value: "failed" },
+              ]}
+            />
+            <Select
+              mode="multiple"
+              size="small"
+              value={traceOperationFilter}
+              onChange={(value) => setTraceOperationFilter(value as TraceOperation[])}
+              options={TRACE_OPERATION_OPTIONS}
+              placeholder="筛选操作类型"
+              maxTagCount="responsive"
+            />
+            <div className="trace-list">
+              {traceLoading ? (
+                <Text className="task-output-empty">加载中...</Text>
+              ) : traceEvents.length === 0 ? (
+                <Text className="task-output-empty">暂无编辑事件</Text>
+              ) : (
+                traceEvents.map((event) => (
+                  <button
+                    key={event.id}
+                    type="button"
+                    className={`trace-item ${traceDetail?.id === event.id ? "active" : ""}`}
+                    onClick={() => void handleSelectTraceEvent(event.id)}
+                  >
+                    <div className="trace-item-top">
+                      <span className="trace-op">{TRACE_OPERATION_LABEL[event.operation]}</span>
+                      <span className={`trace-status ${event.status}`}>{event.status === "ok" ? "成功" : "失败"}</span>
+                    </div>
+                    <div className="trace-path" title={event.targetPath}>{event.targetPath}</div>
+                    <div className="trace-meta">
+                      <span>{formatTraceTime(event.timestamp)}</span>
+                      {event.diff && (
+                        <span>
+                          +{event.diff.added} -{event.diff.removed} ~{event.diff.changed}
+                        </span>
+                      )}
+                    </div>
+                  </button>
+                ))
+              )}
+            </div>
+          </Card>
+        </details>
+
+        <details className="sidebar-advanced-block">
+          <summary>高级功能：任务历史</summary>
+          <Card size="small" className="status-block task-history-block">
+            <div className="task-history-header">
+              <Text strong>任务历史</Text>
+              <Button
+                size="small"
+                className="task-clear-btn"
+                onClick={clearTaskHistory}
+                disabled={taskHistory.length === 0}
+              >
+                清空
+              </Button>
+            </div>
+            <div className="task-history-list">
+              {taskHistory.length === 0 ? (
+                <Text className="task-output-empty">暂无任务记录</Text>
+              ) : (
+                taskHistory.map((item) => (
+                  <div className="task-history-item" key={item.id}>
+                    <div className="task-history-top">
+                      <span className="task-history-type">{TASK_META[item.taskType].label}</span>
+                      <span className={`task-history-status ${item.status}`}>
+                        {item.status === "running" ? "运行中" : item.status === "success" ? "成功" : "失败"}
+                      </span>
+                    </div>
+                    <div className="task-history-input">{item.inputText || "(空输入)"}</div>
+                    {item.error ? <div className="task-history-error">{item.error}</div> : null}
+                  </div>
+                ))
+              )}
+            </div>
+          </Card>
+        </details>
+
         {error && <Alert type="error" message={`错误: ${error}`} />}
 
         <div
@@ -1140,21 +1580,12 @@ export default function App() {
                 }}
               />
               <div className="chat-header">
-                <Title level={4}>对话</Title>
-                <Select
-                  value={selectedTask}
-                  onChange={(value) => setSelectedTask(value as TaskType)}
-                  disabled={chatLoading || !bridgeReady}
-                  options={[
-                    { value: "qa", label: TASK_META.qa.label },
-                    { value: "reimburse", label: TASK_META.reimburse.label },
-                    { value: "final_account", label: TASK_META.final_account.label },
-                    { value: "budget", label: TASK_META.budget.label },
-                  ]}
-                />
-                <Button onClick={() => setInputText(getTaskDemoPrompt(selectedTask))} disabled={chatLoading || !bridgeReady}>
-                  填入示例
-                </Button>
+                <div className="chat-header-main">
+                  <Title level={4}>对话执行区</Title>
+                  <Text className="chat-header-subtitle">
+                    当前任务：{TASK_META[selectedTask].label}
+                  </Text>
+                </div>
               </div>
 
               <div className="chat-messages-container">
@@ -1239,7 +1670,117 @@ export default function App() {
               setChatPanePercent((prev) => Math.max(20, Math.min(80, prev + delta)));
             }}
           />
-          <PreviewPanel preview={preview} />
+          {traceDetail && (
+            <section className="trace-detail-panel">
+              <div className="trace-detail-header">
+                <span className="trace-detail-title">编辑回放</span>
+                <Space size="small">
+                  <Button size="small" onClick={() => void handleReplayTraceEvent(traceDetail.id)}>
+                    回放到该步
+                  </Button>
+                  <Button size="small" onClick={() => setTraceDetail(null)}>
+                    收起
+                  </Button>
+                </Space>
+              </div>
+              <div className="trace-detail-grid">
+                <div>类型: {TRACE_OPERATION_LABEL[traceDetail.operation]}</div>
+                <div>时间: {new Date(traceDetail.timestamp).toLocaleString()}</div>
+                <div>状态: {traceDetail.status === "ok" ? "成功" : "失败"}</div>
+                <div>目标: {traceDetail.targetPath}</div>
+                <div>变更前: {traceDetail.before.kind} / {formatBytes(traceDetail.before.size)}</div>
+                <div>变更后: {traceDetail.after.kind} / {formatBytes(traceDetail.after.size)}</div>
+              </div>
+              {traceDetail.diff && (
+                <div className="trace-diff-box">
+                  <div className="trace-diff-summary">
+                    +{traceDetail.diff.added} -{traceDetail.diff.removed} ~{traceDetail.diff.changed}
+                  </div>
+                  <pre className="trace-snippet">
+                    {traceDetail.diff.snippets
+                      .map((snippet) => `L${snippet.line}\n- ${snippet.before}\n+ ${snippet.after}`)
+                      .join("\n\n")}
+                  </pre>
+                </div>
+              )}
+              {(traceDetail.beforeContent || traceDetail.afterContent) && (
+                <div className="trace-content-compare">
+                  <div className="trace-content-pane">
+                    <div className="trace-content-title">Before</div>
+                    <pre className="trace-snippet">
+                      {(traceDetail.beforeContent ?? "").split(/\r?\n/).slice(0, 80).join("\n")}
+                    </pre>
+                  </div>
+                  <div className="trace-content-pane">
+                    <div className="trace-content-title">After</div>
+                    <pre className="trace-snippet">
+                      {(traceDetail.afterContent ?? "").split(/\r?\n/).slice(0, 80).join("\n")}
+                    </pre>
+                  </div>
+                </div>
+              )}
+            </section>
+          )}
+          {preview?.kind === "text" && (
+            <section className="editor-panel">
+              <div className="editor-toolbar">
+                <span className="editor-title">可视化编辑</span>
+                <span className={`editor-status ${editorDirty ? "dirty" : "saved"}`}>
+                  {editorSaving
+                    ? "保存中..."
+                    : editorDirty
+                      ? "未保存"
+                      : editorLastSavedAt
+                        ? `已保存 ${new Date(editorLastSavedAt).toLocaleTimeString()}`
+                        : "已保存"}
+                </span>
+                <label className="editor-autosave">
+                  <input
+                    type="checkbox"
+                    checked={editorAutoSave}
+                    onChange={(event) => setEditorAutoSave(event.target.checked)}
+                  />
+                  自动保存
+                </label>
+                <Button
+                  size="small"
+                  type="primary"
+                  onClick={() => void persistEditedFile(editorContent)}
+                  disabled={editorSaving || !editorDirty}
+                >
+                  保存
+                </Button>
+              </div>
+              <textarea
+                className="editor-textarea"
+                value={editorContent}
+                onChange={(event) => {
+                  const next = event.target.value;
+                  setEditorContent(next);
+                  setEditorDirty(true);
+                  setPreview((prev) => {
+                    if (!prev || prev.kind !== "text") return prev;
+                    return { ...prev, content: next };
+                  });
+                }}
+                onKeyDown={(event) => {
+                  if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "s") {
+                    event.preventDefault();
+                    void persistEditedFile(editorContent);
+                  }
+                }}
+                spellCheck={false}
+              />
+              {editorError && <div className="editor-error">{editorError}</div>}
+            </section>
+          )}
+          <PreviewPanel
+            preview={preview}
+            onExcelCellChange={updateExcelCell}
+            onExcelRangeChange={updateExcelRange}
+            onExcelAppendRows={appendExcelRows}
+            onExcelTrimSheet={trimExcelSheet}
+          />
         </div>
       </main>
     </div>
