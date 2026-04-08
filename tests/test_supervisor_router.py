@@ -1,0 +1,111 @@
+from __future__ import annotations
+
+import tempfile
+import unittest
+from pathlib import Path
+
+from agent.graphs.intent import intent_node, route_by_task
+from agent.graphs.subgraphs.final_account import final_generate_node
+from agent.graphs.subgraphs.file_edit import file_edit_gateway_node
+
+
+class TestSupervisorRouter(unittest.TestCase):
+    def test_intent_node_recon_classification(self) -> None:
+        state = {
+            "payload": {"query": "请核对预算表和决算表差异"},
+            "task_progress": [],
+        }
+        updated = intent_node(state)
+        self.assertEqual(updated.get("task_type"), "final_account")
+        route_decision = updated.get("route_decision", {})
+        self.assertEqual(route_decision.get("task_type"), "recon")
+        self.assertGreaterEqual(float(route_decision.get("confidence", 0.0)), 0.8)
+        self.assertIn("R201_RECON", route_decision.get("reason_codes", []))
+
+    def test_intent_node_explicit_budget_fill(self) -> None:
+        state = {
+            "task_type": "t4_budget_fill",
+            "payload": {"query": "请填写预算表"},
+            "task_progress": [],
+        }
+        updated = intent_node(state)
+        self.assertEqual(updated.get("task_type"), "budget")
+        route_decision = updated.get("route_decision", {})
+        self.assertEqual(route_decision.get("task_type"), "budget_fill")
+        self.assertEqual(route_decision.get("confidence"), 1.0)
+        self.assertTrue(bool(route_decision.get("requires_confirmation")))
+
+    def test_route_by_task_file_edit(self) -> None:
+        self.assertEqual(route_by_task({"task_type": "file_edit"}), "FileEditStartNode")
+
+    def test_file_edit_gateway_node(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            state = {
+                "payload": {
+                    "workspace_root": str(root),
+                    "operation_id": "op-test-1",
+                    "policy": {"requires_confirmation": False},
+                    "actions": [
+                        {
+                            "action": "write_file",
+                            "path": "notes/result.txt",
+                            "content": "hello gateway",
+                        }
+                    ],
+                },
+                "task_progress": [],
+                "errors": [],
+            }
+            updated = file_edit_gateway_node(state)
+            result = updated.get("result", {})
+            self.assertEqual(result.get("type"), "file_edit")
+            self.assertEqual(result.get("status"), "completed")
+            target = root / "notes" / "result.txt"
+            self.assertTrue(target.exists())
+            self.assertEqual(target.read_text(encoding="utf-8"), "hello gateway")
+
+    def test_recon_result_with_structured_differences(self) -> None:
+        state = {
+            "route_decision": {"task_type": "recon"},
+            "payload": {
+                "budget_source": {
+                    "rows": [
+                        {"month": "2026-01", "amount": 1000},
+                        {"month": "2026-02", "amount": 1000},
+                    ]
+                },
+                "actual_source": {
+                    "rows": [
+                        {"month": "2026-01", "amount": 2000},
+                        {"month": "2026-02", "amount": 900},
+                    ]
+                },
+                "recon_policy": {"abs_threshold": 50, "pct_threshold": 0.05},
+            },
+            "errors": [],
+            "task_progress": [],
+        }
+        updated = final_generate_node(state)
+        result = updated.get("result", {})
+        self.assertEqual(result.get("type"), "recon")
+        self.assertIn(result.get("status"), {"failed", "warning", "passed_with_hint", "passed"})
+        summary = result.get("summary", {})
+        self.assertGreaterEqual(int(summary.get("total_items", 0)), 2)
+        self.assertGreaterEqual(int(summary.get("warning", 0)) + int(summary.get("blocking", 0)), 1)
+
+    def test_recon_result_needs_clarification_when_no_data(self) -> None:
+        state = {
+            "route_decision": {"task_type": "recon"},
+            "payload": {},
+            "errors": [],
+            "task_progress": [],
+        }
+        updated = final_generate_node(state)
+        result = updated.get("result", {})
+        self.assertEqual(result.get("type"), "recon")
+        self.assertEqual(result.get("status"), "needs_clarification")
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -1570,7 +1570,16 @@ def _run_workspace_agent(
 
 
 def _extract_task_request(message: str, payload: Dict[str, Any]) -> Tuple[Optional[str], Dict[str, Any]]:
+    alias_map = {
+        "t1_qa": "qa",
+        "t2_recon": "recon",
+        "t3_material": "reimburse",
+        "t4_budget_fill": "budget",
+        "t5_final_fill": "final_account",
+        "t6_file_edit": "file_edit",
+    }
     task_type = str(payload.get("task_type", "")).strip().lower()
+    task_type = alias_map.get(task_type, task_type)
     task_payload = payload.get("task_payload", payload)
     if isinstance(task_payload, dict) and task_type:
         return task_type, task_payload
@@ -1578,10 +1587,156 @@ def _extract_task_request(message: str, payload: Dict[str, Any]) -> Tuple[Option
     if message.startswith("/task "):
         parts = message.split(maxsplit=2)
         task_type = parts[1].strip().lower() if len(parts) > 1 else ""
+        task_type = alias_map.get(task_type, task_type)
         if task_type:
             return task_type, payload
 
     return None, payload
+
+
+def _supervisor_infer_task(message: str, payload: Dict[str, Any]) -> Tuple[Optional[str], float, List[str]]:
+    text = str(message or "").strip().lower()
+    reasons: List[str] = []
+    if not text:
+        return None, 0.0, reasons
+
+    if any(key in text for key in ("修改文件", "编辑文件", "替换文本", "write_file", "replace_text", "xlsx_edit")):
+        reasons.append("R602_FILE_EDIT")
+        return "file_edit", 0.93, reasons
+
+    has_budget = any(key in text for key in ("预算", "budget"))
+    has_final = any(key in text for key in ("决算", "final", "结项"))
+    has_check = any(key in text for key in ("核对", "比对", "差异", "一致性"))
+    has_fill = any(key in text for key in ("填写", "回填", "填报"))
+
+    if has_budget and has_final and has_check:
+        reasons.append("R201_RECON")
+        return "recon", 0.9, reasons
+    if has_budget and has_fill:
+        reasons.append("R401_BUDGET_FILL")
+        return "budget", 0.88, reasons
+    if has_final and has_fill:
+        reasons.append("R501_FINAL_FILL")
+        return "final_account", 0.88, reasons
+    if any(key in text for key in ("整理材料", "报销材料", "附件整理", "打包", "归档")):
+        reasons.append("R301_MATERIAL")
+        return "reimburse", 0.86, reasons
+    if any(key in text for key in ("报销规则", "能不能报", "附件要求", "制度", "口径")):
+        reasons.append("R101_QA")
+        return "qa", 0.85, reasons
+    if has_budget:
+        reasons.append("R402_BUDGET")
+        return "budget", 0.73, reasons
+    if has_final:
+        reasons.append("R502_FINAL")
+        return "final_account", 0.73, reasons
+    if any(key in text for key in ("报销", "发票", "附件")):
+        reasons.append("R302_REIMBURSE")
+        return "qa", 0.72, reasons
+    if bool(payload.get("workspace_mode", False)):
+        reasons.append("R603_WORKSPACE")
+        return "file_edit", 0.66, reasons
+    return None, 0.0, reasons
+
+
+def _looks_like_workspace_intent(message: str) -> bool:
+    text = str(message or "").strip()
+    if not text:
+        return False
+
+    lowered = text.lower()
+    if text.startswith(("/list", "/read ", "/write ", "/append ", "/replace ")):
+        return True
+
+    if _parse_workspace_command(text) is not None:
+        return True
+
+    path_or_file_pattern = (
+        r"([A-Za-z]:\\|/|\.{1,2}[\\/])?[^\s\"'<>|?:*]+"
+        r"\.(py|ts|tsx|js|jsx|json|md|txt|yaml|yml|toml|ini|csv|xlsx|xlsm|docx|pdf)\b"
+    )
+    if re.search(path_or_file_pattern, text, flags=re.IGNORECASE):
+        return True
+
+    file_keywords = (
+        "文件",
+        "目录",
+        "路径",
+        "代码",
+        "仓库",
+        "workspace",
+        "readme",
+        ".gitignore",
+        "main.py",
+        "main.ts",
+    )
+    action_keywords = (
+        "读取",
+        "查看",
+        "打开",
+        "编辑",
+        "修改",
+        "替换",
+        "追加",
+        "写入",
+        "新建",
+        "创建",
+        "删除",
+        "重命名",
+        "列出",
+        "搜索",
+        "查找",
+    )
+    has_file_hint = any(word in lowered for word in file_keywords)
+    has_action_hint = any(word in text for word in action_keywords) or any(word in lowered for word in action_keywords)
+    return bool(has_file_hint and has_action_hint)
+
+
+def _route_request_mode(message: str, payload: Dict[str, Any]) -> Tuple[str, Optional[str], Dict[str, Any]]:
+    override_mode = str(payload.get("route_mode", "")).strip().lower()
+    task_type, task_payload = _extract_task_request(message, payload)
+
+    if override_mode == "task":
+        return "task", task_type, task_payload
+    if override_mode == "workspace":
+        return "workspace", None, payload
+    if override_mode == "chat":
+        return "chat", None, payload
+
+    if task_type:
+        return "task", task_type, task_payload
+
+    supervisor_enabled = payload.get("supervisor_enabled", True)
+    supervisor_enabled = str(supervisor_enabled).strip().lower() not in {"0", "false", "off", "no"}
+    if supervisor_enabled:
+        inferred_task, confidence, reason_codes = _supervisor_infer_task(message, payload)
+        if inferred_task == "file_edit" and confidence >= 0.8:
+            enriched_payload = {
+                **payload,
+                "route_decision": {
+                    "task_type": inferred_task,
+                    "confidence": round(confidence, 3),
+                    "reason_codes": reason_codes,
+                },
+            }
+            return "workspace", None, enriched_payload
+        if inferred_task and confidence >= 0.84:
+            enriched_payload = {
+                **payload,
+                "route_decision": {
+                    "task_type": inferred_task,
+                    "confidence": round(confidence, 3),
+                    "reason_codes": reason_codes,
+                },
+            }
+            return "task", inferred_task, enriched_payload
+
+    workspace_mode = bool(payload.get("workspace_mode", False))
+    workspace_task = str(payload.get("workspace_task", "")).strip()
+    if workspace_mode and (workspace_task or _looks_like_workspace_intent(message)):
+        return "workspace", None, payload
+
+    return "chat", None, payload
 
 
 def _get_llm_base_url() -> str:
@@ -1725,6 +1880,95 @@ def _run_audit(budget_source: Any, actual_source: Any) -> Dict[str, Any]:
     }
 
 
+def _format_task_reply(task_type: str, result: Dict[str, Any]) -> str:
+    normalized_task = str(task_type or "").strip().lower()
+    result_type = str(result.get("type", "")).strip().lower()
+
+    if normalized_task == "recon" or result_type == "recon":
+        summary = result.get("summary", {}) if isinstance(result.get("summary", {}), dict) else {}
+        total_items = int(summary.get("total_items", 0) or 0)
+        blocking = int(summary.get("blocking", 0) or 0)
+        warning = int(summary.get("warning", 0) or 0)
+        hint = int(summary.get("hint", 0) or 0)
+        status = str(result.get("status", "unknown"))
+        if status == "needs_clarification":
+            return str(
+                result.get(
+                    "message",
+                    "核对数据不足，请补充预算与决算数据后重试。",
+                )
+            )
+        base = (
+            f"预算/决算核对完成：状态={status}，共核对 {total_items} 项，"
+            f"阻断 {blocking} 项，预警 {warning} 项，提示 {hint} 项。"
+        )
+        raw_limit = result.get("detail_limit", 3)
+        try:
+            detail_limit = max(1, min(int(raw_limit), 10))
+        except (TypeError, ValueError):
+            detail_limit = 3
+
+        def _to_lines(items: Any, title: str, limit: int) -> List[str]:
+            rows = items if isinstance(items, list) else []
+            lines: List[str] = []
+            for item in rows[:limit]:
+                if not isinstance(item, dict):
+                    continue
+                key = str(item.get("key", "")).strip() or "未命名项"
+                abs_diff = item.get("abs_diff", 0)
+                pct_diff = item.get("pct_diff", 0)
+                reason = str(item.get("reason", "")).strip() or "无"
+                lines.append(f"- {key}：差额={abs_diff}，差异率={pct_diff}，原因={reason}")
+            if not lines:
+                return []
+            return [title] + lines
+
+        def _build_suggestions(blocking_items: Any, warning_items: Any) -> List[str]:
+            suggestions: List[str] = []
+            blocking_rows = blocking_items if isinstance(blocking_items, list) else []
+            warning_rows = warning_items if isinstance(warning_items, list) else []
+            joined_reasons = " ".join(
+                str(item.get("reason", "")) for item in blocking_rows + warning_rows if isinstance(item, dict)
+            )
+
+            if any("缺少对应项" in str(item.get("reason", "")) for item in blocking_rows if isinstance(item, dict)):
+                suggestions.append("补齐预算或决算缺失项后重新核对，确保主键维度（期间/部门/科目/项目）一致。")
+            if any("阻断阈值" in str(item.get("reason", "")) for item in blocking_rows if isinstance(item, dict)):
+                suggestions.append("针对阻断项优先复核金额来源与汇总口径，必要时暂停自动回填。")
+            if any("预警阈值" in str(item.get("reason", "")) for item in warning_rows if isinstance(item, dict)):
+                suggestions.append("预警项建议提供差异说明，并在审批备注中记录原因。")
+            if "口径" in joined_reasons or "币种" in joined_reasons or "税率" in joined_reasons:
+                suggestions.append("检查币种、税率、含税口径是否一致。")
+            if not suggestions and (blocking_rows or warning_rows):
+                suggestions.append("按差异明细逐项复核原始凭证和表内公式，确认后再提交。")
+            return suggestions[:3]
+
+        detail_lines: List[str] = []
+        blocking_items = result.get("blocking_items", [])
+        warning_items = result.get("warning_items", [])
+        detail_lines.extend(_to_lines(blocking_items, "阻断项明细：", detail_limit))
+        detail_lines.extend(_to_lines(warning_items, "预警项明细：", detail_limit))
+        suggestions = _build_suggestions(blocking_items, warning_items)
+        if suggestions:
+            detail_lines.append("建议处理：")
+            detail_lines.extend(f"- {item}" for item in suggestions)
+        if detail_lines:
+            return base + "\n" + "\n".join(detail_lines)
+        return base
+
+    if normalized_task == "file_edit" or result_type == "file_edit":
+        status = str(result.get("status", "unknown"))
+        changeset = result.get("changeset", [])
+        change_count = len(changeset) if isinstance(changeset, list) else 0
+        return f"文件编辑任务完成：状态={status}，变更 {change_count} 项。"
+
+    if normalized_task == "qa" or result_type == "qa":
+        answer = str(result.get("answer", "")).strip()
+        return answer or "问答任务已完成。"
+
+    return f"任务已完成：{task_type}"
+
+
 def _run_v2_task(task_type: str, task_payload: Dict[str, Any]) -> Dict[str, Any]:
     try:
         from agent import EventBus, TaskDispatcher  # noqa: WPS433
@@ -1738,8 +1982,9 @@ def _run_v2_task(task_type: str, task_payload: Dict[str, Any]) -> Dict[str, Any]
     event_bus.subscribe("task_progress", lambda evt: progress_events.append(evt))
     dispatcher = TaskDispatcher(event_bus)
     result = dispatcher.dispatch(task_type, task_payload)
+    reply = _format_task_reply(task_type, result if isinstance(result, dict) else {})
     return {
-        "reply": f"任务已完成：{task_type}",
+        "reply": reply,
         "mode": "task",
         "task_type": task_type,
         "task_result": result,
@@ -1753,7 +1998,7 @@ def _help_text() -> str:
         "1) 输入“运行sample审计”触发内置示例审计；\n"
         "2) 输入“如何修复高风险问题”等规则咨询；\n"
         "3) 传入 payload.budget_source / payload.actual_source 做真实数据审计；\n"
-        "4) 传入 payload.task_type（qa/reimburse/final_account/budget/sandbox_exec）触发新图任务。"
+        "4) 传入 payload.task_type（qa/reimburse/final_account/budget/recon/file_edit/sandbox_exec）触发新图任务。"
         "\n5) 传入 payload.workspace_mode=true + payload.workspace_dir 使用目录编辑工具模式。"
     )
 
@@ -1925,7 +2170,9 @@ def handle_request_stream(request: Dict[str, Any]) -> Iterator[Dict[str, Any]]:
         _reset_memory_session(payload)
     memory_ctx = _memory_context(payload)
 
-    if bool(payload.get("workspace_mode", False)):
+    route_mode, task_type, task_payload = _route_request_mode(message, payload)
+
+    if route_mode == "workspace":
         yield {"type": "status", "status": "正在处理目录编辑任务..."}
         workspace_result = _run_workspace_agent(message, payload, safe_history, memory_context=memory_ctx)
         if not workspace_result.get("ok", True):
@@ -1938,8 +2185,7 @@ def handle_request_stream(request: Dict[str, Any]) -> Iterator[Dict[str, Any]]:
         yield {"type": "done", "response": {"ok": True, **workspace_result}}
         return
 
-    task_type, task_payload = _extract_task_request(message, payload)
-    if task_type:
+    if route_mode == "task" and task_type:
         yield {"type": "status", "status": f"正在执行任务: {task_type}"}
         task_resp = _run_v2_task(task_type, task_payload)
         for step in task_resp.get("task_progress", []):
@@ -2002,13 +2248,14 @@ def handle_request(request: Dict[str, Any]) -> Dict[str, Any]:
         _reset_memory_session(payload)
     memory_ctx = _memory_context(payload)
 
-    if bool(payload.get("workspace_mode", False)):
+    route_mode, task_type, task_payload = _route_request_mode(message, payload)
+
+    if route_mode == "workspace":
         workspace_result = _run_workspace_agent(message, payload, safe_history, memory_context=memory_ctx)
         _remember_turn(payload, message, str(workspace_result.get("reply", "")))
         return workspace_result
 
-    task_type, task_payload = _extract_task_request(message, payload)
-    if task_type:
+    if route_mode == "task" and task_type:
         result = {"ok": True, **_run_v2_task(task_type, task_payload)}
         _remember_turn(payload, message, str(result.get("reply", "")))
         return result

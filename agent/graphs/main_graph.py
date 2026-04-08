@@ -13,6 +13,7 @@ from agent.graphs.subgraphs.budget import (
     load_final_data_node,
     route_after_load_final_data,
 )
+from agent.graphs.subgraphs.file_edit import file_edit_gateway_node, file_edit_start_node
 from agent.graphs.subgraphs.final_account import (
     aggregate_node,
     data_clean_node,
@@ -74,6 +75,8 @@ def build_main_graph() -> Any:
     graph.add_node("BudgetGenerateNode", budget_generate_node)
     graph.add_node("SandboxStartNode", sandbox_start_node)
     graph.add_node("SandboxExecuteNode", sandbox_execute_node)
+    graph.add_node("FileEditStartNode", file_edit_start_node)
+    graph.add_node("FileEditGatewayNode", file_edit_gateway_node)
 
     graph.add_edge(START, "IntentNode")
     graph.add_conditional_edges(
@@ -85,6 +88,7 @@ def build_main_graph() -> Any:
             "FinalStartNode": "FinalStartNode",
             "BudgetStartNode": "BudgetStartNode",
             "SandboxStartNode": "SandboxStartNode",
+            "FileEditStartNode": "FileEditStartNode",
         },
     )
 
@@ -166,5 +170,8 @@ def build_main_graph() -> Any:
 
     graph.add_edge("SandboxStartNode", "SandboxExecuteNode")
     graph.add_edge("SandboxExecuteNode", END)
+
+    graph.add_edge("FileEditStartNode", "FileEditGatewayNode")
+    graph.add_edge("FileEditGatewayNode", END)
 
     return graph.compile()

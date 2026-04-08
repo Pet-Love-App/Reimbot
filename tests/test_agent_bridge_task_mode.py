@@ -242,17 +242,13 @@ class TestAgentBridgeTaskMode(unittest.TestCase):
         self.assertIn("请提供具体文件路径和修改内容", str(parsed.get("reply", "")))
         self.assertEqual(parsed.get("actions"), [])
 
-    def test_workspace_mode_does_not_echo_raw_json_plan(self) -> None:
+    def test_workspace_mode_chat_message_routes_to_llm(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             root = Path(tmp_dir)
-            malformed_plan = (
-                '{ "reply": "请提供具体文件路径和修改内容，例如：'
-                "'E:\\Desktop\\agent\\agent.py 修改为...' 或 '这个文件/当前文件 修改为...'。",
-                ' "actions": [] }'
-            )
+            llm_reply = "这是一个普通问答回复"
 
             with patch.object(self.bridge, "_is_llm_enabled", return_value=True), patch.object(
-                self.bridge, "_llm_chat", return_value=malformed_plan
+                self.bridge, "_llm_chat", return_value=llm_reply
             ):
                 response = self.bridge.handle_request(
                     {
@@ -266,9 +262,97 @@ class TestAgentBridgeTaskMode(unittest.TestCase):
 
             reply = str(response.get("reply", ""))
             self.assertTrue(response.get("ok"))
-            self.assertNotIn('"actions"', reply)
-            self.assertNotIn('{', reply)
-            self.assertIn("请提供具体文件路径和修改内容", reply)
+            self.assertEqual(response.get("mode"), "llm")
+            self.assertEqual(reply, llm_reply)
+
+    def test_supervisor_auto_routes_recon_to_task_mode(self) -> None:
+        with patch.object(
+            self.bridge,
+            "_run_v2_task",
+            return_value={"mode": "task", "task_type": "recon", "reply": "预算/决算核对完成：状态=warning"},
+        ):
+            response = self.bridge.handle_request(
+                {
+                    "message": "请帮我核对预算表和决算表差异",
+                    "payload": {},
+                }
+            )
+        self.assertTrue(response.get("ok"))
+        self.assertEqual(response.get("mode"), "task")
+        self.assertEqual(response.get("task_type"), "recon")
+
+    def test_format_task_reply_for_recon(self) -> None:
+        result = {
+            "type": "recon",
+            "status": "warning",
+            "summary": {"total_items": 8, "blocking": 1, "warning": 2, "hint": 1},
+            "blocking_items": [
+                {
+                    "key": "2026-01|交通费",
+                    "abs_diff": 1200,
+                    "pct_diff": 0.2,
+                    "reason": "超出阻断阈值",
+                }
+            ],
+            "warning_items": [
+                {
+                    "key": "2026-02|物料费",
+                    "abs_diff": 80,
+                    "pct_diff": 0.06,
+                    "reason": "超出预警阈值",
+                }
+            ],
+        }
+        reply = self.bridge._format_task_reply("recon", result)
+        self.assertIn("预算/决算核对完成", reply)
+        self.assertIn("阻断 1 项", reply)
+        self.assertIn("预警 2 项", reply)
+        self.assertIn("阻断项明细", reply)
+        self.assertIn("2026-01|交通费", reply)
+        self.assertIn("预警项明细", reply)
+        self.assertIn("建议处理", reply)
+        self.assertIn("优先复核金额来源与汇总口径", reply)
+
+    def test_format_task_reply_for_recon_detail_limit(self) -> None:
+        result = {
+            "type": "recon",
+            "status": "failed",
+            "summary": {"total_items": 3, "blocking": 3, "warning": 0, "hint": 0},
+            "detail_limit": 1,
+            "blocking_items": [
+                {"key": "A", "abs_diff": 1, "pct_diff": 0.1, "reason": "r1"},
+                {"key": "B", "abs_diff": 2, "pct_diff": 0.2, "reason": "r2"},
+            ],
+        }
+        reply = self.bridge._format_task_reply("recon", result)
+        self.assertIn("A：差额=1", reply)
+        self.assertNotIn("B：差额=2", reply)
+        self.assertIn("建议处理", reply)
+
+    def test_format_task_reply_for_recon_clarification(self) -> None:
+        result = {
+            "type": "recon",
+            "status": "needs_clarification",
+            "message": "请补充预算与决算数据",
+        }
+        reply = self.bridge._format_task_reply("recon", result)
+        self.assertEqual(reply, "请补充预算与决算数据")
+
+    def test_supervisor_auto_routes_file_edit_to_workspace_mode(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            response = self.bridge.handle_request(
+                {
+                    "message": "/write notes.txt\nhello",
+                    "payload": {
+                        "workspace_mode": True,
+                        "workspace_dir": str(root),
+                    },
+                }
+            )
+            self.assertTrue(response.get("ok"))
+            self.assertEqual(response.get("mode"), "workspace")
+            self.assertTrue((root / "notes.txt").exists())
 
 
 if __name__ == "__main__":
