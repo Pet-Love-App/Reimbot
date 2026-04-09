@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { Alert, Button, Card, Input, Select, Space, Typography } from "antd";
+import { Alert, Button, Card, Input, Select, Space, Tag, Typography } from "antd";
 import { FileOutlined, FolderOpenOutlined, FolderOutlined } from "@ant-design/icons";
 
 import { PreviewPanel } from "./components/PreviewPanel";
@@ -23,6 +23,12 @@ type FileTreeNode = {
   isDir: boolean;
   loaded?: boolean;
   children?: FileTreeNode[];
+};
+
+type WorkspaceFileEntry = {
+  name: string;
+  path: string;
+  relativePath: string;
 };
 
 type TaskSummary = {
@@ -77,6 +83,11 @@ export default function App() {
   const [preview, setPreview] = useState<FilePreview | null>(null);
   const [chatLoading, setChatLoading] = useState(false);
   const [inputText, setInputText] = useState("");
+  const [referencedFiles, setReferencedFiles] = useState<WorkspaceFileEntry[]>([]);
+  const [mentionPickerOpen, setMentionPickerOpen] = useState(false);
+  const [mentionKeyword, setMentionKeyword] = useState("");
+  const [workspaceFiles, setWorkspaceFiles] = useState<WorkspaceFileEntry[]>([]);
+  const [workspaceFilesLoading, setWorkspaceFilesLoading] = useState(false);
   const [selectedTask, setSelectedTask] = useState<TaskType>("qa");
   const [taskSummary, setTaskSummary] = useState<TaskSummary | null>(null);
   const [taskHistory, setTaskHistory] = useState<TaskHistoryItem[]>([]);
@@ -84,6 +95,10 @@ export default function App() {
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const scrollRafRef = useRef<number | null>(null);
   const lastSyncedMessagesRef = useRef<string>("");
+  const latestMessagesRef = useRef<ChatMessage[]>([DEFAULT_CHAT_MESSAGE]);
+  const chatHistoryVersionRef = useRef(0);
+  const streamInFlightRef = useRef(false);
+  const chatHistorySaveTimerRef = useRef<number | null>(null);
   const [rootDir, setRootDir] = useState<string | null>(null);
   const [treeNodes, setTreeNodes] = useState<FileTreeNode[]>([]);
   const [expandedPaths, setExpandedPaths] = useState<string[]>([]);
@@ -108,6 +123,7 @@ export default function App() {
 
   const appRef = useRef<HTMLDivElement>(null);
   const contentRef = useRef<HTMLDivElement>(null);
+  const inputComposerRef = useRef<HTMLDivElement>(null);
   const [chatPanePercent, setChatPanePercent] = useState<number>(45);
   const [sidebarWidthPx, setSidebarWidthPx] = useState<number>(280);
   const splitterDragRef = useRef<
@@ -134,6 +150,26 @@ export default function App() {
   const typewriterPendingRef = useRef("");
   const typewriterTimerRef = useRef<number | null>(null);
   const typewriterRunningRef = useRef(false);
+
+  const extractHistoryEnvelope = (
+    payload: unknown
+  ): { history: ChatMessage[]; version?: number } | null => {
+    if (Array.isArray(payload)) {
+      return { history: payload as ChatMessage[] };
+    }
+    if (!payload || typeof payload !== "object") {
+      return null;
+    }
+    const envelope = payload as { history?: unknown; version?: unknown };
+    if (!Array.isArray(envelope.history)) {
+      return null;
+    }
+    const version = Number(envelope.version);
+    return {
+      history: envelope.history as ChatMessage[],
+      version: Number.isFinite(version) ? version : undefined,
+    };
+  };
 
   useEffect(() => {
     try {
@@ -190,6 +226,10 @@ export default function App() {
       }
     };
   }, [messages, chatLoading]);
+
+  useEffect(() => {
+    latestMessagesRef.current = messages;
+  }, [messages]);
   const [error, setError] = useState<string | null>(
     bridgeReady
       ? null
@@ -270,25 +310,47 @@ export default function App() {
       return;
     }
 
+    let unsubscribeWorkspace: (() => void) | null = null;
+
+    const loadRootTree = async (dir: string) => {
+      setRootDir(dir);
+      setExpandedPaths([]);
+      const result = await bridge.listDir(dir);
+      if (result?.ok && Array.isArray(result.entries)) {
+        setTreeNodes(result.entries.map((entry: FileTreeNode) => ({ ...entry, loaded: false })));
+      } else {
+        setTreeNodes([]);
+      }
+    };
+
     const hydrateRoot = async () => {
       try {
         setTreeLoading(true);
-        const dir = await bridge.getProjectDir();
+        const boundDir =
+          typeof bridge.getWorkspaceDir === "function" ? await bridge.getWorkspaceDir() : null;
+        const dir = boundDir || (await bridge.getProjectDir());
         if (dir) {
-          setRootDir(dir);
-          const result = await bridge.listDir(dir);
-          if (result?.ok && Array.isArray(result.entries)) {
-            setTreeNodes(result.entries.map((entry: FileTreeNode) => ({ ...entry, loaded: false })));
-          } else {
-            setTreeNodes([]);
-          }
+          await loadRootTree(dir);
         }
       } finally {
         setTreeLoading(false);
       }
     };
 
+    if (typeof bridge.subscribeWorkspaceUpdate === "function") {
+      unsubscribeWorkspace = bridge.subscribeWorkspaceUpdate((dir) => {
+        if (!dir) return;
+        setTreeLoading(true);
+        void loadRootTree(dir).finally(() => {
+          setTreeLoading(false);
+        });
+      });
+    }
+
     void hydrateRoot();
+    return () => {
+      if (unsubscribeWorkspace) unsubscribeWorkspace();
+    };
   }, [bridge]);
 
   const updateTreeNode = (
@@ -413,6 +475,115 @@ export default function App() {
     }
   };
 
+  const toRelativePath = (targetPath: string): string => {
+    if (!rootDir) return targetPath;
+    const normalizedRoot = rootDir.replace(/\\/g, "/").toLowerCase();
+    const normalizedTarget = targetPath.replace(/\\/g, "/");
+    if (normalizedTarget.toLowerCase().startsWith(`${normalizedRoot}/`)) {
+      return normalizedTarget.slice(normalizedRoot.length + 1);
+    }
+    if (normalizedTarget.toLowerCase() === normalizedRoot) {
+      return "";
+    }
+    return normalizedTarget;
+  };
+
+  const ensureWorkspaceFilesLoaded = async () => {
+    if (
+      !rootDir ||
+      !bridge ||
+      typeof (bridge as any).listWorkspaceFiles !== "function" ||
+      workspaceFilesLoading
+    ) {
+      return;
+    }
+    if (workspaceFiles.length > 0) {
+      return;
+    }
+    setWorkspaceFilesLoading(true);
+    try {
+      const result = await (bridge as any).listWorkspaceFiles(rootDir);
+      if (result?.ok && Array.isArray(result.files)) {
+        setWorkspaceFiles(result.files as WorkspaceFileEntry[]);
+      } else {
+        setWorkspaceFiles([]);
+      }
+    } finally {
+      setWorkspaceFilesLoading(false);
+    }
+  };
+
+  const openMentionPicker = () => {
+    if (!bridgeReady || !rootDir) return;
+    setMentionPickerOpen(true);
+    void ensureWorkspaceFilesLoaded();
+  };
+
+  const removeReferencedFile = (targetPath: string) => {
+    setReferencedFiles((prev) => prev.filter((item) => item.path !== targetPath));
+  };
+
+  const selectReferencedFile = (entry: WorkspaceFileEntry) => {
+    setReferencedFiles((prev) => {
+      if (prev.some((item) => item.path === entry.path)) return prev;
+      return [...prev, entry];
+    });
+    setMentionPickerOpen(false);
+    setMentionKeyword("");
+    setInputText((prev) => prev.replace(/@$/, ""));
+  };
+
+  const filteredWorkspaceFiles = useMemo(() => {
+    const keyword = mentionKeyword.trim().toLowerCase();
+    if (!keyword) {
+      return workspaceFiles.slice(0, 200);
+    }
+    return workspaceFiles
+      .filter((item) => item.relativePath.toLowerCase().includes(keyword))
+      .slice(0, 200);
+  }, [mentionKeyword, workspaceFiles]);
+
+  const buildReferencedContext = async (): Promise<{
+    referencedPaths: string[];
+    referencedContextText: string;
+  }> => {
+    if (!bridge || referencedFiles.length === 0) {
+      return { referencedPaths: [], referencedContextText: "" };
+    }
+    const snippets: string[] = [];
+    for (const item of referencedFiles.slice(0, 8)) {
+      try {
+        const result = (await bridge.readFile(item.path)) as any;
+        if (!result?.ok) {
+          snippets.push(
+            `文件: ${item.relativePath}\n类型: unreadable\n说明: ${String(result?.error || "读取失败")}`
+          );
+          continue;
+        }
+        if (result.kind === "text") {
+          const content = String(result.content || "");
+          snippets.push(
+            `文件: ${item.relativePath}\n类型: text\n内容:\n${content.slice(0, 6000)}${
+              content.length > 6000 || result.truncated ? "\n...(已截断)" : ""
+            }`
+          );
+          continue;
+        }
+        snippets.push(`文件: ${item.relativePath}\n类型: ${String(result.kind || "binary")}\n说明: 非文本文件`);
+      } catch (err) {
+        snippets.push(
+          `文件: ${item.relativePath}\n类型: unreadable\n说明: ${
+            err instanceof Error ? err.message : String(err)
+          }`
+        );
+      }
+    }
+    return {
+      referencedPaths: referencedFiles.map((item) => item.relativePath || toRelativePath(item.path)),
+      referencedContextText: snippets.join("\n\n---\n\n"),
+    };
+  };
+
   useEffect(() => {
     if (!rootDir || !bridge || typeof bridge.listDir !== "function") {
       return;
@@ -422,6 +593,36 @@ export default function App() {
     }, 3000);
     return () => window.clearInterval(timer);
   }, [rootDir, bridge, expandedPaths]);
+
+  useEffect(() => {
+    if (!rootDir || !bridge || typeof bridge.setWorkspaceDir !== "function") {
+      return;
+    }
+    void bridge.setWorkspaceDir(rootDir);
+  }, [rootDir, bridge]);
+
+  useEffect(() => {
+    setWorkspaceFiles([]);
+    setMentionKeyword("");
+    setMentionPickerOpen(false);
+    setReferencedFiles([]);
+  }, [rootDir]);
+
+  useEffect(() => {
+    if (!mentionPickerOpen) {
+      return;
+    }
+    const onMouseDown = (event: MouseEvent) => {
+      const container = inputComposerRef.current;
+      if (!container) return;
+      if (container.contains(event.target as Node)) return;
+      setMentionPickerOpen(false);
+    };
+    window.addEventListener("mousedown", onMouseDown);
+    return () => {
+      window.removeEventListener("mousedown", onMouseDown);
+    };
+  }, [mentionPickerOpen]);
 
   const renderTreeNodes = (nodes: FileTreeNode[], depth = 0) => {
     return nodes.map((node) => {
@@ -466,23 +667,51 @@ export default function App() {
     let unsubscribe: (() => void) | null = null;
 
     const hydrateHistory = async () => {
-      const history = (await bridge.getChatHistory()) as ChatMessage[] | undefined;
+      const historyPayload = await bridge.getChatHistory();
+      const parsed = extractHistoryEnvelope(historyPayload);
+      const history = parsed?.history;
+      if (typeof parsed?.version === "number") {
+        chatHistoryVersionRef.current = parsed.version;
+      }
       if (Array.isArray(history) && history.length > 0) {
-        lastSyncedMessagesRef.current = JSON.stringify(history);
+        const serialized = JSON.stringify(history);
+        lastSyncedMessagesRef.current = serialized;
+        latestMessagesRef.current = history;
         setMessages(history);
       } else {
-        lastSyncedMessagesRef.current = JSON.stringify([DEFAULT_CHAT_MESSAGE]);
-        void bridge.setChatHistory([DEFAULT_CHAT_MESSAGE]);
+        const fallback = [DEFAULT_CHAT_MESSAGE];
+        const serialized = JSON.stringify(fallback);
+        lastSyncedMessagesRef.current = serialized;
+        latestMessagesRef.current = fallback;
+        setMessages(fallback);
+        void bridge.setChatHistory(fallback).then((result) => {
+          const version = Number((result as { version?: unknown })?.version);
+          if (Number.isFinite(version)) {
+            chatHistoryVersionRef.current = Math.max(chatHistoryVersionRef.current, version);
+          }
+        });
       }
     };
 
     if (typeof bridge.subscribeChatHistory === "function") {
-      unsubscribe = bridge.subscribeChatHistory((history: unknown) => {
-        if (!Array.isArray(history)) return;
-        const serialized = JSON.stringify(history);
+      unsubscribe = bridge.subscribeChatHistory((payload: unknown) => {
+        const parsed = extractHistoryEnvelope(payload);
+        if (!parsed) return;
+        if (streamInFlightRef.current) return;
+        if (
+          typeof parsed.version === "number" &&
+          parsed.version < chatHistoryVersionRef.current
+        ) {
+          return;
+        }
+        if (typeof parsed.version === "number") {
+          chatHistoryVersionRef.current = parsed.version;
+        }
+        const serialized = JSON.stringify(parsed.history);
         if (serialized === lastSyncedMessagesRef.current) return;
         lastSyncedMessagesRef.current = serialized;
-        setMessages(history as ChatMessage[]);
+        latestMessagesRef.current = parsed.history;
+        setMessages(parsed.history);
       });
     }
 
@@ -496,12 +725,37 @@ export default function App() {
     if (!bridge || typeof bridge.setChatHistory !== "function") {
       return;
     }
+    if (streamInFlightRef.current) {
+      return;
+    }
     const serialized = JSON.stringify(messages);
     if (serialized === lastSyncedMessagesRef.current) {
       return;
     }
-    lastSyncedMessagesRef.current = serialized;
-    void bridge.setChatHistory(messages);
+    if (chatHistorySaveTimerRef.current !== null) {
+      window.clearTimeout(chatHistorySaveTimerRef.current);
+    }
+    chatHistorySaveTimerRef.current = window.setTimeout(() => {
+      const snapshot = latestMessagesRef.current;
+      const snapshotSerialized = JSON.stringify(snapshot);
+      if (snapshotSerialized === lastSyncedMessagesRef.current) {
+        return;
+      }
+      lastSyncedMessagesRef.current = snapshotSerialized;
+      void bridge.setChatHistory(snapshot).then((result) => {
+        const version = Number((result as { version?: unknown })?.version);
+        if (Number.isFinite(version)) {
+          chatHistoryVersionRef.current = Math.max(chatHistoryVersionRef.current, version);
+        }
+      });
+      chatHistorySaveTimerRef.current = null;
+    }, 120);
+    return () => {
+      if (chatHistorySaveTimerRef.current !== null) {
+        window.clearTimeout(chatHistorySaveTimerRef.current);
+        chatHistorySaveTimerRef.current = null;
+      }
+    };
   }, [bridge, messages]);
 
   useEffect(() => {
@@ -620,8 +874,6 @@ export default function App() {
     }
 
     typewriterRunningRef.current = true;
-    const intervalMs = 18;
-    const charsPerTick = 4;
 
     const tick = () => {
       const pending = typewriterPendingRef.current;
@@ -631,6 +883,9 @@ export default function App() {
         return;
       }
 
+      // Adaptive speed avoids visible stalls when upstream emits large chunks.
+      const charsPerTick = pending.length > 240 ? 24 : pending.length > 120 ? 14 : pending.length > 60 ? 8 : 4;
+      const intervalMs = pending.length > 240 ? 8 : pending.length > 120 ? 12 : 16;
       const slice = pending.slice(0, charsPerTick);
       typewriterPendingRef.current = pending.slice(charsPerTick);
       appendToLastAgentMessage(slice);
@@ -902,7 +1157,12 @@ export default function App() {
       })),
       { role: "user", content: text },
     ];
-    const taskPayload = getTaskPayload(selectedTask, text);
+    const referencedContext = await buildReferencedContext();
+    const taskPayload = {
+      ...getTaskPayload(selectedTask, text),
+      referenced_files: referencedContext.referencedPaths,
+      referenced_file_context: referencedContext.referencedContextText,
+    };
     const useWorkspaceMode = selectedTask === "qa" && Boolean(rootDir);
     const historyId = `${Date.now()}-${Math.random().toString(16).slice(2, 8)}`;
     pushTaskHistory({
@@ -926,11 +1186,14 @@ export default function App() {
         typeof bridge.subscribeAgentChatEvent === "function";
 
       if (!supportsStream) {
+        streamInFlightRef.current = false;
         const response = (await (useWorkspaceMode
           ? bridge.chatWithAgent(text, {
               history: historyForAgent,
               workspace_mode: true,
               workspace_dir: rootDir,
+              referenced_files: referencedContext.referencedPaths,
+              referenced_file_context: referencedContext.referencedContextText,
             })
           : typeof (bridge as any).runAgentTask === "function"
             ? (bridge as any).runAgentTask(selectedTask, taskPayload)
@@ -938,6 +1201,8 @@ export default function App() {
                 history: historyForAgent,
                 task_type: selectedTask,
                 task_payload: taskPayload,
+                referenced_files: referencedContext.referencedPaths,
+                referenced_file_context: referencedContext.referencedContextText,
               }))) as AgentChatResponse;
         if (!response.ok) {
           const friendly = buildFriendlyError(response.error);
@@ -965,6 +1230,7 @@ export default function App() {
         return;
       }
 
+      streamInFlightRef.current = true;
       setMessages((prev) => [...prev, { role: "agent", content: "", status: "正在连接 Agent..." }]);
 
       let startedChatId = "";
@@ -991,18 +1257,19 @@ export default function App() {
         }
 
         if (event.type === "error") {
-          stopTypewriter();
+          flushTypewriterAll();
           const friendly = buildFriendlyError(event.error || "未知错误");
           const errText = friendly.detail;
           replaceLastAgentMessage(streamedText ? `${streamedText}\n\n${errText}` : errText);
           updateLastAgentMessageStatus("");
           updateTaskHistory(historyId, { status: "failed", error: friendly.short });
+          streamInFlightRef.current = false;
           stopListening();
           setChatLoading(false);
           return;
         }
 
-        stopTypewriter();
+        flushTypewriterAll();
 
         const response = event.response as AgentChatResponse;
         if (!response.ok) {
@@ -1026,6 +1293,7 @@ export default function App() {
         updateTaskHistory(historyId, { status: "success", error: undefined });
         replaceLastAgentMessage(finalContent);
         updateLastAgentMessageStatus("");
+        streamInFlightRef.current = false;
         stopListening();
         setChatLoading(false);
       });
@@ -1036,6 +1304,8 @@ export default function App() {
               history: historyForAgent,
               workspace_mode: true,
               workspace_dir: rootDir,
+              referenced_files: referencedContext.referencedPaths,
+              referenced_file_context: referencedContext.referencedContextText,
             })
           : typeof (bridge as any).startAgentTaskStream === "function"
             ? (bridge as any).startAgentTaskStream(selectedTask, taskPayload)
@@ -1043,6 +1313,8 @@ export default function App() {
                 history: historyForAgent,
                 task_type: selectedTask,
                 task_payload: taskPayload,
+                referenced_files: referencedContext.referencedPaths,
+                referenced_file_context: referencedContext.referencedContextText,
               }));
         startedChatId = started.chatId;
         updateLastAgentMessageStatus(
@@ -1053,6 +1325,8 @@ export default function App() {
         throw startErr;
       }
     } catch (err) {
+      streamInFlightRef.current = false;
+      stopTypewriter();
       const friendly = buildFriendlyError(err instanceof Error ? err.message : String(err));
       const errText = friendly.detail;
       updateTaskHistory(historyId, {
@@ -1619,17 +1893,72 @@ export default function App() {
                 </div>
               </div>
 
-              <div className="chat-input-row">
-                <Input
-                  value={inputText}
-                  onChange={(event) => setInputText(event.target.value)}
-                  onPressEnter={() => void handleSend()}
-                  placeholder={`输入${selectedTask === "qa" ? "问题" : "任务说明"}，当前任务：${TASK_META[selectedTask].label}`}
-                  disabled={!bridgeReady || chatLoading}
-                />
-                <Button onClick={() => void handleSend()} disabled={!bridgeReady || chatLoading} type="primary">
-                  {chatLoading ? "发送中..." : "发送"}
-                </Button>
+              <div className="chat-input-row chat-input-row--column" ref={inputComposerRef}>
+                {referencedFiles.length > 0 && (
+                  <div className="chat-referenced-tabs">
+                    {referencedFiles.map((item) => (
+                      <Tag
+                        key={item.path}
+                        closable
+                        onClose={(event) => {
+                          event.preventDefault();
+                          removeReferencedFile(item.path);
+                        }}
+                        className="chat-reference-tag"
+                      >
+                        {item.relativePath || item.name}
+                      </Tag>
+                    ))}
+                  </div>
+                )}
+                {mentionPickerOpen && (
+                  <div className="mention-picker-panel">
+                    <Input
+                      size="small"
+                      value={mentionKeyword}
+                      placeholder="搜索文件路径..."
+                      onChange={(event) => setMentionKeyword(event.target.value)}
+                    />
+                    <div className="mention-picker-list">
+                      {workspaceFilesLoading ? (
+                        <div className="mention-picker-empty">正在加载文件...</div>
+                      ) : filteredWorkspaceFiles.length === 0 ? (
+                        <div className="mention-picker-empty">未匹配到文件</div>
+                      ) : (
+                        filteredWorkspaceFiles.map((item) => (
+                          <button
+                            type="button"
+                            key={item.path}
+                            className="mention-picker-item"
+                            onClick={() => selectReferencedFile(item)}
+                          >
+                            <span className="mention-picker-name">{item.name}</span>
+                            <span className="mention-picker-path">{item.relativePath}</span>
+                          </button>
+                        ))
+                      )}
+                    </div>
+                  </div>
+                )}
+                <div className="chat-input-actions">
+                  <Input
+                    value={inputText}
+                    onChange={(event) => {
+                      const next = event.target.value;
+                      const insertedAt = next.length > inputText.length && next.endsWith("@");
+                      setInputText(next);
+                      if (insertedAt) {
+                        openMentionPicker();
+                      }
+                    }}
+                    onPressEnter={() => void handleSend()}
+                    placeholder={`输入${selectedTask === "qa" ? "问题" : "任务说明"}，当前任务：${TASK_META[selectedTask].label}（输入 @ 引用文件）`}
+                    disabled={!bridgeReady || chatLoading}
+                  />
+                  <Button onClick={() => void handleSend()} disabled={!bridgeReady || chatLoading} type="primary">
+                    {chatLoading ? "发送中..." : "发送"}
+                  </Button>
+                </div>
               </div>
         </section>
 

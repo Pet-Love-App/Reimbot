@@ -124,10 +124,22 @@ const api = {
   getProjectDir: async (): Promise<string> => ipcRenderer.invoke("template:getProjectDir"),
   pickProjectDir: async (): Promise<{ ok: boolean; dir?: string; message?: string }> =>
     ipcRenderer.invoke("template:pickDir"),
+  getWorkspaceDir: async (): Promise<string | null> => ipcRenderer.invoke("pet:getWorkspaceDir"),
+  setWorkspaceDir: async (
+    targetPath: string
+  ): Promise<{ ok: boolean; dir?: string; message?: string }> =>
+    ipcRenderer.invoke("pet:setWorkspaceDir", targetPath),
   listDir: async (
     dirPath: string
   ): Promise<{ ok: boolean; entries?: Array<{ name: string; path: string; isDir: boolean }>; error?: string }> =>
     ipcRenderer.invoke("template:listDir", dirPath),
+  listWorkspaceFiles: async (
+    dirPath: string
+  ): Promise<{
+    ok: boolean;
+    files?: Array<{ name: string; path: string; relativePath: string }>;
+    error?: string;
+  }> => ipcRenderer.invoke("template:listWorkspaceFiles", dirPath),
   readFile: async (targetPath: string): Promise<unknown> => ipcRenderer.invoke("template:readFile", targetPath),
   writeFile: async (
     targetPath: string,
@@ -223,7 +235,7 @@ const api = {
   ): Promise<{ chatId: string }> => ipcRenderer.invoke("agent:task:start", { taskType, taskPayload }),
   stopAgentChatStream: async (chatId: string): Promise<void> => ipcRenderer.invoke("agent:chat:stop", chatId),
   getChatHistory: async (): Promise<unknown> => ipcRenderer.invoke("chat:history:get"),
-  setChatHistory: async (history: unknown): Promise<{ ok: boolean }> =>
+  setChatHistory: async (history: unknown): Promise<{ ok: boolean; version?: number }> =>
     ipcRenderer.invoke("chat:history:set", history),
   listChatSessions: async (): Promise<ChatSessionsState> => ipcRenderer.invoke("chat:sessions:list"),
   createChatSession: async (title?: string): Promise<unknown> =>
@@ -268,6 +280,13 @@ const api = {
     };
     ipcRenderer.on("llm:config:updated", wrapped);
     return () => ipcRenderer.removeListener("llm:config:updated", wrapped);
+  },
+  subscribeWorkspaceUpdate: (handler: (dir: string | null) => void): Unsubscribe => {
+    const wrapped = (_event: Electron.IpcRendererEvent, payload: string | null) => {
+      handler(payload);
+    };
+    ipcRenderer.on("pet:workspace-updated", wrapped);
+    return () => ipcRenderer.removeListener("pet:workspace-updated", wrapped);
   },
 };
 

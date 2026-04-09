@@ -6,6 +6,7 @@ from typing import Any, Dict, List, TypedDict
 class AppState(TypedDict, total=False):
     task_type: str
     payload: Dict[str, Any]
+    route_decision: Dict[str, Any]
 
     files: List[str]
     classified_files: Dict[str, List[str]]
@@ -23,6 +24,7 @@ class AppState(TypedDict, total=False):
 
     qa_answer: Dict[str, Any]
     sandbox_result: Dict[str, Any]
+    file_tool_result: Dict[str, Any]
     outputs: Dict[str, Any]
     result: Dict[str, Any]
 

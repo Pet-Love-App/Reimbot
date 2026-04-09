@@ -94,6 +94,7 @@ TEXT_EDIT_BLOCKED_SUFFIXES = {
 }
 
 XLSX_EDIT_SUFFIXES = {".xlsx", ".xlsm"}
+HIGH_RISK_FILE_ACTIONS = {"write_file", "append_file", "replace_text", "xlsx_edit", "material_package"}
 
 DEFAULT_REIMBURSE_CATEGORY_KEYWORDS: Dict[str, Set[str]] = {
     "报销单": {"报销单", "报销申请", "报销", "reimburse"},
@@ -837,6 +838,89 @@ def _merge_context_blocks(*blocks: str) -> str:
     return "\n\n".join(cleaned)
 
 
+def _referenced_files_context(payload: Dict[str, Any]) -> str:
+    blocks: List[str] = []
+    raw_files = payload.get("referenced_files", [])
+    if isinstance(raw_files, list) and raw_files:
+        files = [str(item).strip() for item in raw_files if str(item).strip()]
+        if files:
+            blocks.append("用户指定参考文件:\n" + "\n".join(f"- {item}" for item in files[:20]))
+
+    raw_context = str(payload.get("referenced_file_context", "")).strip()
+    if raw_context:
+        blocks.append("用户引用文件内容:\n" + raw_context[:24000])
+
+    return _merge_context_blocks(*blocks)
+
+
+def _referenced_file_paths(payload: Dict[str, Any]) -> List[str]:
+    raw_files = payload.get("referenced_files", [])
+    if not isinstance(raw_files, list):
+        return []
+    return [str(item).strip() for item in raw_files if str(item).strip()]
+
+
+def _resolve_message_with_referenced_file(message: str, payload: Dict[str, Any]) -> str:
+    text = str(message or "").strip()
+    if not text:
+        return text
+    referenced_files = _referenced_file_paths(payload)
+    if len(referenced_files) != 1:
+        return text
+
+    target = referenced_files[0]
+    lowered = text.lower()
+    has_pronoun = any(token in text for token in ("这个文件", "当前文件", "该文件", "这个表", "这个excel"))
+    has_target = target in text or target.lower() in lowered
+    has_file_ext = bool(
+        re.search(
+            r"\.(py|ts|tsx|js|jsx|json|md|txt|yaml|yml|toml|ini|csv|xlsx|xlsm|docx|pdf)\b",
+            text,
+            flags=re.IGNORECASE,
+        )
+    )
+    if has_target or has_file_ext or not has_pronoun:
+        return text
+
+    return f"{text}\n\n用户指代的目标文件是：{target}"
+
+
+def _build_direct_plan_from_single_reference(message: str, payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    text = str(message or "").strip()
+    if not text:
+        return None
+    referenced_files = _referenced_file_paths(payload)
+    if len(referenced_files) != 1:
+        return None
+
+    target = referenced_files[0]
+    lower = text.lower()
+    has_data_intent = any(token in text for token in ("测试数据", "追加", "加入", "新增")) or "append" in lower
+    if not has_data_intent:
+        return None
+
+    if not target.lower().endswith((".xlsx", ".xlsm")):
+        return None
+
+    count_match = re.search(r"(\d+)\s*条", text)
+    count = int(count_match.group(1)) if count_match else 5
+    count = max(1, min(count, 2000))
+    sheet_match = re.search(r"\b(Sheet\d+)\b", text, flags=re.IGNORECASE)
+    requested_sheet = sheet_match.group(1) if sheet_match else "Sheet1"
+    rows = [{"学号": 1000 + i + 1, "姓名": f"测试{i + 1}"} for i in range(count)]
+    return {
+        "reply": f"已按你引用的文件执行：向 {target} 的 {requested_sheet} 追加 {count} 条测试数据。",
+        "actions": [
+            {
+                "action": "xlsx_edit",
+                "path": target,
+                "sheet": requested_sheet,
+                "append_dict_rows": rows,
+            }
+        ],
+    }
+
+
 def _safe_workspace_root(payload: Dict[str, Any]) -> Optional[Path]:
     workspace_raw = str(payload.get("workspace_dir", "")).strip()
     if not workspace_raw:
@@ -862,7 +946,9 @@ def _safe_workspace_target(root: Path, relative_path: str) -> Path:
     return target
 
 
-def _workspace_tree_text(root: Path, *, max_files: int = 120) -> str:
+def _workspace_tree_text(root: Path, *, max_files: Optional[int] = None) -> str:
+    if max_files is None:
+        max_files = _safe_int_env("AGENT_WORKSPACE_TREE_MAX_FILES", 5000, min_value=200)
     rows: List[str] = []
     count = 0
     for current, dirs, files in os.walk(root):
@@ -1410,6 +1496,7 @@ def _run_workspace_agent(
     payload: Dict[str, Any],
     history: List[Dict[str, str]],
     memory_context: str = "",
+    referenced_context: str = "",
 ) -> Dict[str, Any]:
     workspace_root = _safe_workspace_root(payload)
     if workspace_root is None:
@@ -1419,6 +1506,9 @@ def _run_workspace_agent(
         }
 
     directory_tree = _workspace_tree_text(workspace_root)
+    effective_message = _resolve_message_with_referenced_file(message, payload)
+    referenced_files = _referenced_file_paths(payload)
+    resolved_target_hint = referenced_files[0] if len(referenced_files) == 1 else ""
 
     command_plan: Optional[Dict[str, Any]] = None
 
@@ -1438,7 +1528,12 @@ def _run_workspace_agent(
         }
 
     if command_plan is None:
-        command_plan = _parse_workspace_command(message)
+        # Deterministic fast path: when user selected exactly one file with '@',
+        # execute data-append style requests directly to avoid unnecessary path clarification.
+        command_plan = _build_direct_plan_from_single_reference(message, payload)
+
+    if command_plan is None:
+        command_plan = _parse_workspace_command(effective_message)
     if command_plan is not None:
         logs = _workspace_execute_actions(workspace_root, command_plan.get("actions", []))
         if command_plan.get("actions") and command_plan["actions"][0].get("action") == "list_files":
@@ -1475,8 +1570,14 @@ def _run_workspace_agent(
             记忆上下文（可用于保持连续性）:
             {memory_context or '(无)'}
 
+            用户当前引用文件（优先参考）:
+            {referenced_context or '(无)'}
+
+            已解析唯一引用目标:
+            {resolved_target_hint or '(无)'}
+
             用户请求:
-            {message}
+            {effective_message}
 
             先在心里完成以下判断，再输出 JSON：
             - 意图类型：问答 / 读文件 / 改文件 / 列目录 / 其他。
@@ -1489,8 +1590,10 @@ def _run_workspace_agent(
             2) 用户只给文件名（如 main.ts）：
                - 若目录树中唯一命中，可直接操作；
                - 若有多个同名文件，禁止猜测，reply 里列出候选路径并请用户确认，actions 置空。
-            3) 用户说“这个文件/当前文件”但没有可确定路径时，禁止猜测，reply 里明确要求用户提供相对路径，actions 置空。
-            4) 仅当文件可唯一确定时，才允许输出写入类 actions。
+            3) 若“已解析唯一引用目标”不为空，且用户说“这个文件/当前文件”，直接将该目标作为 path。
+            4) 用户说“这个文件/当前文件”但没有可确定路径时，禁止猜测，reply 里明确要求用户提供相对路径，actions 置空。
+            5) 仅当文件可唯一确定时，才允许输出写入类 actions。
+            6) 若“已解析唯一引用目标”不为空，不要再向用户追问路径，直接执行或仅追问业务字段。
 
             请仅返回 JSON 对象，不要加解释文字。格式：
             {{
@@ -1570,7 +1673,16 @@ def _run_workspace_agent(
 
 
 def _extract_task_request(message: str, payload: Dict[str, Any]) -> Tuple[Optional[str], Dict[str, Any]]:
+    alias_map = {
+        "t1_qa": "qa",
+        "t2_recon": "recon",
+        "t3_material": "reimburse",
+        "t4_budget_fill": "budget",
+        "t5_final_fill": "final_account",
+        "t6_file_edit": "file_edit",
+    }
     task_type = str(payload.get("task_type", "")).strip().lower()
+    task_type = alias_map.get(task_type, task_type)
     task_payload = payload.get("task_payload", payload)
     if isinstance(task_payload, dict) and task_type:
         return task_type, task_payload
@@ -1578,10 +1690,186 @@ def _extract_task_request(message: str, payload: Dict[str, Any]) -> Tuple[Option
     if message.startswith("/task "):
         parts = message.split(maxsplit=2)
         task_type = parts[1].strip().lower() if len(parts) > 1 else ""
+        task_type = alias_map.get(task_type, task_type)
         if task_type:
             return task_type, payload
 
     return None, payload
+
+
+def _supervisor_infer_task(message: str, payload: Dict[str, Any]) -> Tuple[Optional[str], float, List[str]]:
+    text = str(message or "").strip().lower()
+    reasons: List[str] = []
+    if not text:
+        return None, 0.0, reasons
+
+    if any(key in text for key in ("修改文件", "编辑文件", "替换文本", "write_file", "replace_text", "xlsx_edit")):
+        reasons.append("R602_FILE_EDIT")
+        return "file_edit", 0.93, reasons
+
+    has_budget = any(key in text for key in ("预算", "budget"))
+    has_final = any(key in text for key in ("决算", "final", "结项"))
+    has_check = any(key in text for key in ("核对", "比对", "差异", "一致性"))
+    has_fill = any(key in text for key in ("填写", "回填", "填报"))
+
+    if has_budget and has_final and has_check:
+        reasons.append("R201_RECON")
+        return "recon", 0.9, reasons
+    if has_budget and has_fill:
+        reasons.append("R401_BUDGET_FILL")
+        return "budget", 0.88, reasons
+    if has_final and has_fill:
+        reasons.append("R501_FINAL_FILL")
+        return "final_account", 0.88, reasons
+    if any(key in text for key in ("整理材料", "报销材料", "附件整理", "打包", "归档")):
+        reasons.append("R301_MATERIAL")
+        return "reimburse", 0.86, reasons
+    if any(key in text for key in ("报销规则", "能不能报", "附件要求", "制度", "口径")):
+        reasons.append("R101_QA")
+        return "qa", 0.85, reasons
+    if has_budget:
+        reasons.append("R402_BUDGET")
+        return "budget", 0.73, reasons
+    if has_final:
+        reasons.append("R502_FINAL")
+        return "final_account", 0.73, reasons
+    if any(key in text for key in ("报销", "发票", "附件")):
+        reasons.append("R302_REIMBURSE")
+        return "qa", 0.72, reasons
+    if bool(payload.get("workspace_mode", False)):
+        reasons.append("R603_WORKSPACE")
+        return "file_edit", 0.66, reasons
+    return None, 0.0, reasons
+
+
+def _looks_like_workspace_intent(message: str) -> bool:
+    text = str(message or "").strip()
+    if not text:
+        return False
+
+    lowered = text.lower()
+    if text.startswith(("/list", "/read ", "/write ", "/append ", "/replace ")):
+        return True
+
+    if _parse_workspace_command(text) is not None:
+        return True
+
+    path_or_file_pattern = (
+        r"([A-Za-z]:\\|/|\.{1,2}[\\/])?[^\s\"'<>|?:*]+"
+        r"\.(py|ts|tsx|js|jsx|json|md|txt|yaml|yml|toml|ini|csv|xlsx|xlsm|docx|pdf)\b"
+    )
+    if re.search(path_or_file_pattern, text, flags=re.IGNORECASE):
+        return True
+
+    file_keywords = (
+        "文件",
+        "目录",
+        "路径",
+        "代码",
+        "仓库",
+        "workspace",
+        "readme",
+        ".gitignore",
+        "main.py",
+        "main.ts",
+    )
+    action_keywords = (
+        "读取",
+        "查看",
+        "打开",
+        "编辑",
+        "修改",
+        "替换",
+        "追加",
+        "写入",
+        "新建",
+        "创建",
+        "删除",
+        "重命名",
+        "列出",
+        "搜索",
+        "查找",
+    )
+    has_file_hint = any(word in lowered for word in file_keywords)
+    has_action_hint = any(word in text for word in action_keywords) or any(word in lowered for word in action_keywords)
+    return bool(has_file_hint and has_action_hint)
+
+
+def _route_request_mode(message: str, payload: Dict[str, Any]) -> Tuple[str, Optional[str], Dict[str, Any]]:
+    override_mode = str(payload.get("route_mode", "")).strip().lower()
+    task_type, task_payload = _extract_task_request(message, payload)
+
+    if override_mode == "task":
+        return "task", task_type, task_payload
+    if override_mode == "workspace":
+        enriched_payload = {**payload, "workspace_mode": True}
+        return "task", "auto", enriched_payload
+    if override_mode == "chat":
+        return "task", "auto", payload
+
+    if task_type:
+        return "task", task_type, task_payload
+
+    # Unify routing: implicit requests always enter the graph as auto tasks,
+    # then IntentNode becomes the only task-type decision source.
+    return "task", "auto", payload
+
+
+def _prepare_task_payload_for_dispatch(
+    message: str,
+    base_payload: Dict[str, Any],
+    task_payload: Dict[str, Any],
+    task_type: str,
+) -> Dict[str, Any]:
+    merged_payload: Dict[str, Any] = {}
+    if isinstance(base_payload, dict):
+        merged_payload.update(base_payload)
+    if isinstance(task_payload, dict):
+        merged_payload.update(task_payload)
+
+    merged_payload["query"] = str(merged_payload.get("query", "")).strip() or str(message or "").strip()
+
+    workspace_dir = str(
+        merged_payload.get("workspace_dir", "") or merged_payload.get("workspace_root", "")
+    ).strip()
+    if workspace_dir:
+        merged_payload["workspace_dir"] = workspace_dir
+        merged_payload.setdefault("workspace_root", workspace_dir)
+
+    referenced_files = _referenced_file_paths(merged_payload)
+    should_prepare_file_actions = (
+        task_type == "file_edit"
+        or bool(merged_payload.get("workspace_mode", False))
+        or len(referenced_files) > 0
+        or _looks_like_workspace_intent(message)
+    )
+    if should_prepare_file_actions:
+        effective_message = _resolve_message_with_referenced_file(message, merged_payload)
+        if not isinstance(merged_payload.get("actions"), list) or not merged_payload.get("actions"):
+            command_plan = _build_direct_plan_from_single_reference(message, merged_payload)
+            if command_plan is None:
+                command_plan = _parse_workspace_command(effective_message)
+            if isinstance(command_plan, dict):
+                actions = command_plan.get("actions", [])
+                if isinstance(actions, list):
+                    merged_payload["actions"] = [item for item in actions if isinstance(item, dict)]
+
+        policy = merged_payload.get("policy", {})
+        if not isinstance(policy, dict):
+            policy = {}
+        safe_actions = (
+            [item for item in merged_payload.get("actions", []) if isinstance(item, dict)]
+            if isinstance(merged_payload.get("actions", []), list)
+            else []
+        )
+        inferred_requires_confirmation = any(
+            str(item.get("action", "")).strip() in HIGH_RISK_FILE_ACTIONS for item in safe_actions
+        )
+        if "requires_confirmation" not in policy:
+            policy["requires_confirmation"] = inferred_requires_confirmation
+        merged_payload["policy"] = policy
+
+    return merged_payload
 
 
 def _get_llm_base_url() -> str:
@@ -1693,36 +1981,216 @@ def _rule_reply(message: str, payload: Dict[str, Any]) -> Optional[Dict[str, Any
 
 def _brief_report(report_json: Dict[str, Any]) -> str:
     summary = report_json.get("summary", {})
-    total = summary.get("total_issues", 0)
-    high = summary.get("high_risk_issues", 0)
-    status = summary.get("overall_status", "UNKNOWN")
+    total = int(summary.get("total_issues", summary.get("total_items", 0)) or 0)
+    high = int(summary.get("high_risk_issues", summary.get("blocking_items", 0)) or 0)
+    status = str(summary.get("overall_status", "UNKNOWN"))
     return f"审计完成：状态={status}，问题总数={total}，高风险={high}。"
+
+
+def _recon_to_report_json(recon_result: Dict[str, Any]) -> Dict[str, Any]:
+    summary = recon_result.get("summary", {}) if isinstance(recon_result.get("summary", {}), dict) else {}
+    total_items = int(summary.get("total_items", 0) or 0)
+    blocking = int(summary.get("blocking", 0) or 0)
+    warning = int(summary.get("warning", 0) or 0)
+    hint = int(summary.get("hint", 0) or 0)
+    status = str(recon_result.get("status", "unknown")).upper()
+    differences = recon_result.get("differences", [])
+    return {
+        "summary": {
+            "overall_status": status,
+            "total_items": total_items,
+            "blocking_items": blocking,
+            "warning_items": warning,
+            "hint_items": hint,
+            "total_issues": blocking + warning + hint,
+            "high_risk_issues": blocking,
+        },
+        "thresholds": recon_result.get("thresholds", {}),
+        "discrepancies": differences if isinstance(differences, list) else [],
+        "blocking_items": recon_result.get("blocking_items", []),
+        "warning_items": recon_result.get("warning_items", []),
+        "hint_items": recon_result.get("hint_items", []),
+        "suggestion_rules": recon_result.get("suggestion_rules", []),
+        "errors": recon_result.get("errors", []),
+    }
+
+
+def _recon_to_report_markdown(recon_result: Dict[str, Any]) -> str:
+    status = str(recon_result.get("status", "unknown"))
+    if status == "needs_clarification":
+        message = str(recon_result.get("message", "")).strip() or "缺少核对数据，请补充预算与决算数据后重试。"
+        return f"# 预算/决算核对报告\n\n{message}"
+
+    summary = recon_result.get("summary", {}) if isinstance(recon_result.get("summary", {}), dict) else {}
+    total_items = int(summary.get("total_items", 0) or 0)
+    blocking = int(summary.get("blocking", 0) or 0)
+    warning = int(summary.get("warning", 0) or 0)
+    hint = int(summary.get("hint", 0) or 0)
+    lines = [
+        "# 预算/决算核对报告",
+        "",
+        f"- 状态：{status}",
+        f"- 核对总项：{total_items}",
+        f"- 阻断：{blocking}",
+        f"- 预警：{warning}",
+        f"- 提示：{hint}",
+    ]
+    blocking_items = recon_result.get("blocking_items", [])
+    if isinstance(blocking_items, list) and blocking_items:
+        lines.extend(["", "## 阻断项（前 3 条）"])
+        for item in blocking_items[:3]:
+            if not isinstance(item, dict):
+                continue
+            key = str(item.get("key", "未命名项"))
+            abs_diff = item.get("abs_diff", 0)
+            pct_diff = item.get("pct_diff", 0)
+            reason = str(item.get("reason", ""))
+            lines.append(f"- {key}：差额={abs_diff}，差异率={pct_diff}，原因={reason}")
+    return "\n".join(lines)
 
 
 def _run_audit(budget_source: Any, actual_source: Any) -> Dict[str, Any]:
     try:
-        from agent.graph_builder import build_graph  # noqa: WPS433
+        from agent import EventBus, TaskDispatcher  # noqa: WPS433
     except ModuleNotFoundError as exc:
         raise RuntimeError(
             "审计模式依赖缺失，请在当前 Python 环境安装 requirements.txt（含 pandas/langgraph/jsonschema）。"
         ) from exc
 
-    app = build_graph()
-    state: Dict[str, Any] = {
+    payload: Dict[str, Any] = {
         "budget_source": budget_source,
         "actual_source": actual_source,
-        "discrepancies": [],
-        "suggestions": [],
     }
-    result = app.invoke(state)
-    report = result.get("report", {})
-    report_json = report.get("report_json", {})
-    report_markdown = report.get("report_markdown", "")
+    dispatcher = TaskDispatcher(EventBus())
+    recon_result = dispatcher.dispatch("recon", payload)
+    report_json = _recon_to_report_json(recon_result if isinstance(recon_result, dict) else {})
+    report_markdown = _recon_to_report_markdown(recon_result if isinstance(recon_result, dict) else {})
     return {
         "reply": _brief_report(report_json),
         "report_json": report_json,
         "report_markdown": report_markdown,
     }
+
+
+def _format_task_reply(task_type: str, result: Dict[str, Any]) -> str:
+    normalized_task = str(task_type or "").strip().lower()
+    result_type = str(result.get("type", "")).strip().lower()
+    result_status = str(result.get("status", "")).strip().lower()
+
+    if result_type == "confirmation":
+        message = str(result.get("message", "")).strip()
+        return message or "检测到高风险写操作，请先确认后再执行。"
+
+    if result_type == "clarification":
+        message = str(result.get("message", "")).strip()
+        return message or "当前请求信息不足，请补充目标与输入范围后重试。"
+
+    if normalized_task == "recon" or result_type == "recon":
+        summary = result.get("summary", {}) if isinstance(result.get("summary", {}), dict) else {}
+        total_items = int(summary.get("total_items", 0) or 0)
+        blocking = int(summary.get("blocking", 0) or 0)
+        warning = int(summary.get("warning", 0) or 0)
+        hint = int(summary.get("hint", 0) or 0)
+        status = str(result.get("status", "unknown"))
+        if status == "needs_clarification":
+            return str(
+                result.get(
+                    "message",
+                    "核对数据不足，请补充预算与决算数据后重试。",
+                )
+            )
+        base = (
+            f"预算/决算核对完成：状态={status}，共核对 {total_items} 项，"
+            f"阻断 {blocking} 项，预警 {warning} 项，提示 {hint} 项。"
+        )
+        raw_limit = result.get("detail_limit", 3)
+        try:
+            detail_limit = max(1, min(int(raw_limit), 10))
+        except (TypeError, ValueError):
+            detail_limit = 3
+
+        def _to_lines(items: Any, title: str, limit: int) -> List[str]:
+            rows = items if isinstance(items, list) else []
+            lines: List[str] = []
+            for item in rows[:limit]:
+                if not isinstance(item, dict):
+                    continue
+                key = str(item.get("key", "")).strip() or "未命名项"
+                abs_diff = item.get("abs_diff", 0)
+                pct_diff = item.get("pct_diff", 0)
+                reason = str(item.get("reason", "")).strip() or "无"
+                lines.append(f"- {key}：差额={abs_diff}，差异率={pct_diff}，原因={reason}")
+            if not lines:
+                return []
+            return [title] + lines
+
+        def _build_suggestions(blocking_items: Any, warning_items: Any) -> List[str]:
+            suggestions: List[str] = []
+            blocking_rows = blocking_items if isinstance(blocking_items, list) else []
+            warning_rows = warning_items if isinstance(warning_items, list) else []
+            joined_reasons = " ".join(
+                str(item.get("reason", "")) for item in blocking_rows + warning_rows if isinstance(item, dict)
+            )
+            custom_rules = result.get("suggestion_rules", [])
+            if isinstance(custom_rules, list):
+                for rule in custom_rules[:12]:
+                    if not isinstance(rule, dict):
+                        continue
+                    reason_contains = rule.get("reason_contains", [])
+                    if isinstance(reason_contains, str):
+                        reason_tokens = [reason_contains]
+                    elif isinstance(reason_contains, list):
+                        reason_tokens = [str(item).strip() for item in reason_contains if str(item).strip()]
+                    else:
+                        reason_tokens = []
+                    suggestion = str(rule.get("suggestion", "")).strip()
+                    if not suggestion:
+                        continue
+                    if reason_tokens and not any(token in joined_reasons for token in reason_tokens):
+                        continue
+                    if suggestion not in suggestions:
+                        suggestions.append(suggestion)
+
+            if any("缺少对应项" in str(item.get("reason", "")) for item in blocking_rows if isinstance(item, dict)):
+                suggestions.append("补齐预算或决算缺失项后重新核对，确保主键维度（期间/部门/科目/项目）一致。")
+            if any("阻断阈值" in str(item.get("reason", "")) for item in blocking_rows if isinstance(item, dict)):
+                suggestions.append("针对阻断项优先复核金额来源与汇总口径，必要时暂停自动回填。")
+            if any("预警阈值" in str(item.get("reason", "")) for item in warning_rows if isinstance(item, dict)):
+                suggestions.append("预警项建议提供差异说明，并在审批备注中记录原因。")
+            if "口径" in joined_reasons or "币种" in joined_reasons or "税率" in joined_reasons:
+                suggestions.append("检查币种、税率、含税口径是否一致。")
+            if not suggestions and (blocking_rows or warning_rows):
+                suggestions.append("按差异明细逐项复核原始凭证和表内公式，确认后再提交。")
+            return suggestions[:3]
+
+        detail_lines: List[str] = []
+        blocking_items = result.get("blocking_items", [])
+        warning_items = result.get("warning_items", [])
+        detail_lines.extend(_to_lines(blocking_items, "阻断项明细：", detail_limit))
+        detail_lines.extend(_to_lines(warning_items, "预警项明细：", detail_limit))
+        suggestions = _build_suggestions(blocking_items, warning_items)
+        if suggestions:
+            detail_lines.append("建议处理：")
+            detail_lines.extend(f"- {item}" for item in suggestions)
+        if detail_lines:
+            return base + "\n" + "\n".join(detail_lines)
+        return base
+
+    if normalized_task == "file_edit" or result_type == "file_edit":
+        status = str(result.get("status", "unknown"))
+        if result_status in {"needs_clarification", "pending_confirmation"}:
+            message = str(result.get("message", "")).strip()
+            if message:
+                return message
+        changeset = result.get("changeset", [])
+        change_count = len(changeset) if isinstance(changeset, list) else 0
+        return f"文件编辑任务完成：状态={status}，变更 {change_count} 项。"
+
+    if normalized_task == "qa" or result_type == "qa":
+        answer = str(result.get("answer", "")).strip()
+        return answer or "问答任务已完成。"
+
+    return f"任务已完成：{task_type}"
 
 
 def _run_v2_task(task_type: str, task_payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -1738,8 +2206,9 @@ def _run_v2_task(task_type: str, task_payload: Dict[str, Any]) -> Dict[str, Any]
     event_bus.subscribe("task_progress", lambda evt: progress_events.append(evt))
     dispatcher = TaskDispatcher(event_bus)
     result = dispatcher.dispatch(task_type, task_payload)
+    reply = _format_task_reply(task_type, result if isinstance(result, dict) else {})
     return {
-        "reply": f"任务已完成：{task_type}",
+        "reply": reply,
         "mode": "task",
         "task_type": task_type,
         "task_result": result,
@@ -1753,7 +2222,7 @@ def _help_text() -> str:
         "1) 输入“运行sample审计”触发内置示例审计；\n"
         "2) 输入“如何修复高风险问题”等规则咨询；\n"
         "3) 传入 payload.budget_source / payload.actual_source 做真实数据审计；\n"
-        "4) 传入 payload.task_type（qa/reimburse/final_account/budget/sandbox_exec）触发新图任务。"
+        "4) 传入 payload.task_type（qa/reimburse/final_account/budget/recon/file_edit/sandbox_exec）触发新图任务。"
         "\n5) 传入 payload.workspace_mode=true + payload.workspace_dir 使用目录编辑工具模式。"
     )
 
@@ -1924,24 +2393,20 @@ def handle_request_stream(request: Dict[str, Any]) -> Iterator[Dict[str, Any]]:
     if bool(payload.get("memory_reset", False)):
         _reset_memory_session(payload)
     memory_ctx = _memory_context(payload)
+    referenced_ctx = _referenced_files_context(payload)
 
-    if bool(payload.get("workspace_mode", False)):
-        yield {"type": "status", "status": "正在处理目录编辑任务..."}
-        workspace_result = _run_workspace_agent(message, payload, safe_history, memory_context=memory_ctx)
-        if not workspace_result.get("ok", True):
-            yield {"type": "error", "error": str(workspace_result.get("error", "目录任务失败"))}
-            return
-        reply = str(workspace_result.get("reply", "已处理"))
-        _remember_turn(payload, message, reply)
-        for chunk in _iter_text_chunks(reply):
-            yield {"type": "delta", "delta": chunk}
-        yield {"type": "done", "response": {"ok": True, **workspace_result}}
-        return
+    route_mode, task_type, task_payload = _route_request_mode(message, payload)
 
-    task_type, task_payload = _extract_task_request(message, payload)
-    if task_type:
-        yield {"type": "status", "status": f"正在执行任务: {task_type}"}
-        task_resp = _run_v2_task(task_type, task_payload)
+    if route_mode == "task":
+        effective_task_type = str(task_type or "").strip() or "auto"
+        prepared_task_payload = _prepare_task_payload_for_dispatch(
+            message=message,
+            base_payload=payload,
+            task_payload=task_payload if isinstance(task_payload, dict) else {},
+            task_type=effective_task_type,
+        )
+        yield {"type": "status", "status": f"正在执行任务: {effective_task_type}"}
+        task_resp = _run_v2_task(effective_task_type, prepared_task_payload)
         for step in task_resp.get("task_progress", []):
             step_name = str(step.get("step", ""))
             tool_name = str(step.get("tool_name", ""))
@@ -1969,7 +2434,7 @@ def handle_request_stream(request: Dict[str, Any]) -> Iterator[Dict[str, Any]]:
 
     if _is_llm_enabled():
         yield {"type": "status", "status": "正在调用 RAG 知识库检索..."}
-        kb_context = _merge_context_blocks(_get_kb_context(message), memory_ctx)
+        kb_context = _merge_context_blocks(_get_kb_context(message), memory_ctx, referenced_ctx)
         yield {"type": "status", "status": "正在生成回答..."}
         streamed_reply = ""
         try:
@@ -2001,15 +2466,19 @@ def handle_request(request: Dict[str, Any]) -> Dict[str, Any]:
     if bool(payload.get("memory_reset", False)):
         _reset_memory_session(payload)
     memory_ctx = _memory_context(payload)
+    referenced_ctx = _referenced_files_context(payload)
 
-    if bool(payload.get("workspace_mode", False)):
-        workspace_result = _run_workspace_agent(message, payload, safe_history, memory_context=memory_ctx)
-        _remember_turn(payload, message, str(workspace_result.get("reply", "")))
-        return workspace_result
+    route_mode, task_type, task_payload = _route_request_mode(message, payload)
 
-    task_type, task_payload = _extract_task_request(message, payload)
-    if task_type:
-        result = {"ok": True, **_run_v2_task(task_type, task_payload)}
+    if route_mode == "task":
+        effective_task_type = str(task_type or "").strip() or "auto"
+        prepared_task_payload = _prepare_task_payload_for_dispatch(
+            message=message,
+            base_payload=payload,
+            task_payload=task_payload if isinstance(task_payload, dict) else {},
+            task_type=effective_task_type,
+        )
+        result = {"ok": True, **_run_v2_task(effective_task_type, prepared_task_payload)}
         _remember_turn(payload, message, str(result.get("reply", "")))
         return result
 
@@ -2020,7 +2489,7 @@ def handle_request(request: Dict[str, Any]) -> Dict[str, Any]:
         return result
 
     if _is_llm_enabled():
-        kb_context = _merge_context_blocks(_get_kb_context(message), memory_ctx)
+        kb_context = _merge_context_blocks(_get_kb_context(message), memory_ctx, referenced_ctx)
         llm_reply = _llm_chat(message=message, history=safe_history, kb_context=kb_context)
         _remember_turn(payload, message, llm_reply)
         return {"ok": True, "reply": llm_reply, "mode": "llm"}

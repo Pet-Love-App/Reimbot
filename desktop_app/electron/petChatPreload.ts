@@ -40,7 +40,7 @@ const api = {
     ipcRenderer.invoke("pet:chat:start", { message, history }),
   stopChatStream: async (chatId: string): Promise<void> => ipcRenderer.invoke("pet:chat:stop", chatId),
   getChatHistory: async (): Promise<unknown> => ipcRenderer.invoke("chat:history:get"),
-  setChatHistory: async (history: unknown): Promise<{ ok: boolean }> =>
+  setChatHistory: async (history: unknown): Promise<{ ok: boolean; version?: number }> =>
     ipcRenderer.invoke("chat:history:set", history),
   listChatSessions: async (): Promise<ChatSessionsState> => ipcRenderer.invoke("chat:sessions:list"),
   createChatSession: async (title?: string): Promise<unknown> =>

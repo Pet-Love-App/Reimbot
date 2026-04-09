@@ -1,8 +1,9 @@
 import { useEffect, useRef, useState } from "react";
 import type { KeyboardEvent } from "react";
 import { Button, Input, Modal, Select, Space, Typography, message as antdMessage } from "antd";
+import { MarkdownRenderer } from "../components/MarkdownRenderer";
 
-type ChatMessage = { role: "user" | "agent"; content: string };
+type ChatMessage = { role: "user" | "agent"; content: string; status?: string };
 type ChatSessionMeta = {
   id: string;
   title: string;
@@ -65,6 +66,7 @@ const QUICK_PROMPTS = [
   "读取 src/main.ts 并概述结构",
   "把 README 标题改成“智能报销助手”",
 ];
+const STREAM_IDLE_TIMEOUT_MS = 45000;
 
 export function PetChatWindow() {
   const [messages, setMessages] = useState<ChatMessage[]>([DEFAULT_CHAT_MESSAGE]);
@@ -79,6 +81,30 @@ export function PetChatWindow() {
   const [llmConfigSaving, setLlmConfigSaving] = useState(false);
   const chatEndRef = useRef<HTMLDivElement>(null);
   const lastSyncedMessagesRef = useRef<string>("");
+  const latestMessagesRef = useRef<ChatMessage[]>([DEFAULT_CHAT_MESSAGE]);
+  const chatHistoryVersionRef = useRef(0);
+  const streamInFlightRef = useRef(false);
+  const chatHistorySaveTimerRef = useRef<number | null>(null);
+
+  const extractHistoryEnvelope = (
+    payload: unknown
+  ): { history: ChatMessage[]; version?: number } | null => {
+    if (Array.isArray(payload)) {
+      return { history: payload as ChatMessage[] };
+    }
+    if (!payload || typeof payload !== "object") {
+      return null;
+    }
+    const envelope = payload as { history?: unknown; version?: unknown };
+    if (!Array.isArray(envelope.history)) {
+      return null;
+    }
+    const version = Number(envelope.version);
+    return {
+      history: envelope.history as ChatMessage[],
+      version: Number.isFinite(version) ? version : undefined,
+    };
+  };
 
   useEffect(() => {
     document.body.classList.add("pet-route-body");
@@ -92,6 +118,10 @@ export function PetChatWindow() {
 
   useEffect(() => {
     chatEndRef.current?.scrollIntoView({ behavior: "smooth" });
+  }, [messages]);
+
+  useEffect(() => {
+    latestMessagesRef.current = messages;
   }, [messages]);
 
   useEffect(() => {
@@ -174,23 +204,51 @@ export function PetChatWindow() {
         }
       }
 
-      const history = (await api.getChatHistory()) as ChatMessage[] | undefined;
+      const historyPayload = await api.getChatHistory();
+      const parsed = extractHistoryEnvelope(historyPayload);
+      const history = parsed?.history;
+      if (typeof parsed?.version === "number") {
+        chatHistoryVersionRef.current = parsed.version;
+      }
       if (Array.isArray(history) && history.length > 0) {
-        lastSyncedMessagesRef.current = JSON.stringify(history);
+        const serialized = JSON.stringify(history);
+        lastSyncedMessagesRef.current = serialized;
+        latestMessagesRef.current = history;
         setMessages(history);
       } else {
-        lastSyncedMessagesRef.current = JSON.stringify([DEFAULT_CHAT_MESSAGE]);
-        void api.setChatHistory([DEFAULT_CHAT_MESSAGE]);
+        const fallback = [DEFAULT_CHAT_MESSAGE];
+        const serialized = JSON.stringify(fallback);
+        lastSyncedMessagesRef.current = serialized;
+        latestMessagesRef.current = fallback;
+        setMessages(fallback);
+        void api.setChatHistory(fallback).then((result) => {
+          const version = Number((result as { version?: unknown })?.version);
+          if (Number.isFinite(version)) {
+            chatHistoryVersionRef.current = Math.max(chatHistoryVersionRef.current, version);
+          }
+        });
       }
     };
 
     if (typeof api.subscribeChatHistory === "function") {
-      unsubscribeHistory = api.subscribeChatHistory((history: unknown) => {
-        if (!Array.isArray(history)) return;
-        const serialized = JSON.stringify(history);
+      unsubscribeHistory = api.subscribeChatHistory((payload: unknown) => {
+        const parsed = extractHistoryEnvelope(payload);
+        if (!parsed) return;
+        if (streamInFlightRef.current) return;
+        if (
+          typeof parsed.version === "number" &&
+          parsed.version < chatHistoryVersionRef.current
+        ) {
+          return;
+        }
+        if (typeof parsed.version === "number") {
+          chatHistoryVersionRef.current = parsed.version;
+        }
+        const serialized = JSON.stringify(parsed.history);
         if (serialized === lastSyncedMessagesRef.current) return;
         lastSyncedMessagesRef.current = serialized;
-        setMessages(history as ChatMessage[]);
+        latestMessagesRef.current = parsed.history;
+        setMessages(parsed.history);
       });
     }
 
@@ -215,15 +273,41 @@ export function PetChatWindow() {
   }, []);
 
   useEffect(() => {
-    if (!window.petChatApi || typeof window.petChatApi.setChatHistory !== "function") {
+    const api = window.petChatApi;
+    if (!api || typeof api.setChatHistory !== "function") {
+      return;
+    }
+    if (streamInFlightRef.current) {
       return;
     }
     const serialized = JSON.stringify(messages);
     if (serialized === lastSyncedMessagesRef.current) {
       return;
     }
-    lastSyncedMessagesRef.current = serialized;
-    void window.petChatApi.setChatHistory(messages);
+    if (chatHistorySaveTimerRef.current !== null) {
+      window.clearTimeout(chatHistorySaveTimerRef.current);
+    }
+    chatHistorySaveTimerRef.current = window.setTimeout(() => {
+      const snapshot = latestMessagesRef.current;
+      const snapshotSerialized = JSON.stringify(snapshot);
+      if (snapshotSerialized === lastSyncedMessagesRef.current) {
+        return;
+      }
+      lastSyncedMessagesRef.current = snapshotSerialized;
+      void api.setChatHistory(snapshot).then((result) => {
+        const version = Number((result as { version?: unknown })?.version);
+        if (Number.isFinite(version)) {
+          chatHistoryVersionRef.current = Math.max(chatHistoryVersionRef.current, version);
+        }
+      });
+      chatHistorySaveTimerRef.current = null;
+    }, 120);
+    return () => {
+      if (chatHistorySaveTimerRef.current !== null) {
+        window.clearTimeout(chatHistorySaveTimerRef.current);
+        chatHistorySaveTimerRef.current = null;
+      }
+    };
   }, [messages]);
 
   const appendMessage = (message: ChatMessage) => {
@@ -243,12 +327,24 @@ export function PetChatWindow() {
     });
   };
 
+  const updateLastAgentMessageStatus = (status: string) => {
+    setMessages((prev) => {
+      for (let index = prev.length - 1; index >= 0; index -= 1) {
+        if (prev[index].role !== "agent") continue;
+        const next = [...prev];
+        next[index] = { ...next[index], status };
+        return next;
+      }
+      return prev;
+    });
+  };
+
   const replaceLastAgentMessage = (content: string) => {
     setMessages((prev) => {
       for (let index = prev.length - 1; index >= 0; index -= 1) {
         if (prev[index].role !== "agent") continue;
         const next = [...prev];
-        next[index] = { ...next[index], content };
+        next[index] = { ...next[index], content, status: "" };
         return next;
       }
       return prev;
@@ -271,6 +367,7 @@ export function PetChatWindow() {
     const history = [...messages, userMessage];
 
     if (!supportsStream) {
+      streamInFlightRef.current = false;
       const resp = await window.petChatApi.chat(text, history);
       if (!resp || !resp.ok) {
         appendMessage({ role: "agent", content: "失败：" + ((resp && resp.error) || "未知错误") });
@@ -283,10 +380,94 @@ export function PetChatWindow() {
       return;
     }
 
+    streamInFlightRef.current = true;
     setMessages((prev) => [...prev, { role: "agent", content: "" }]);
 
     let startedChatId = "";
     let streamedText = "";
+    let streamLastActivityAt = Date.now();
+    let streamWatchdogTimer: number | null = null;
+    let typewriterPending = "";
+    let typewriterTimer: number | null = null;
+    let typewriterRunning = false;
+    let streamActive = true;
+
+    const clearStreamTimers = () => {
+      if (streamWatchdogTimer !== null) {
+        window.clearInterval(streamWatchdogTimer);
+        streamWatchdogTimer = null;
+      }
+      if (typewriterTimer !== null) {
+        window.clearTimeout(typewriterTimer);
+        typewriterTimer = null;
+      }
+      typewriterRunning = false;
+    };
+
+    const flushTypewriterAll = () => {
+      if (typewriterTimer !== null) {
+        window.clearTimeout(typewriterTimer);
+        typewriterTimer = null;
+      }
+      typewriterRunning = false;
+      if (typewriterPending) {
+        appendToLastAgentMessage(typewriterPending);
+        typewriterPending = "";
+      }
+    };
+
+    const pushTypewriterDelta = (delta: string) => {
+      if (!delta) return;
+      typewriterPending += delta;
+      if (typewriterRunning) return;
+
+      typewriterRunning = true;
+      const tick = () => {
+        if (!typewriterPending) {
+          typewriterRunning = false;
+          typewriterTimer = null;
+          return;
+        }
+        // Adaptive speed avoids long backlog when model returns big deltas.
+        const charsPerTick =
+          typewriterPending.length > 240
+            ? 24
+            : typewriterPending.length > 120
+              ? 14
+              : typewriterPending.length > 60
+                ? 8
+                : 4;
+        const intervalMs = typewriterPending.length > 240 ? 8 : typewriterPending.length > 120 ? 12 : 16;
+        const slice = typewriterPending.slice(0, charsPerTick);
+        typewriterPending = typewriterPending.slice(charsPerTick);
+        appendToLastAgentMessage(slice);
+        typewriterTimer = window.setTimeout(tick, intervalMs);
+      };
+      typewriterTimer = window.setTimeout(tick, 0);
+    };
+
+    const startWatchdog = (stopListening: () => void) => {
+      if (streamWatchdogTimer !== null) {
+        window.clearInterval(streamWatchdogTimer);
+      }
+      streamWatchdogTimer = window.setInterval(() => {
+        if (!streamActive) return;
+        const idleFor = Date.now() - streamLastActivityAt;
+        if (idleFor < STREAM_IDLE_TIMEOUT_MS) return;
+        flushTypewriterAll();
+        const timeoutText = "失败：流式输出超时，请重试。";
+        replaceLastAgentMessage(streamedText ? `${streamedText}\n\n${timeoutText}` : timeoutText);
+        updateLastAgentMessageStatus("");
+        if (startedChatId && typeof window.petChatApi?.stopChatStream === "function") {
+          void window.petChatApi.stopChatStream(startedChatId);
+        }
+        stopListening();
+        clearStreamTimers();
+        streamActive = false;
+        streamInFlightRef.current = false;
+        setChatLoading(false);
+      }, 1000);
+    };
 
     const stopListening = window.petChatApi.subscribeChatEvent((event) => {
       if (!startedChatId) {
@@ -295,19 +476,30 @@ export function PetChatWindow() {
       if (event.chatId !== startedChatId) {
         return;
       }
+      streamLastActivityAt = Date.now();
+      if (event.type === "status") {
+        updateLastAgentMessageStatus(event.status || "正在处理...");
+        return;
+      }
       if (event.type === "delta") {
         streamedText += event.delta;
-        appendToLastAgentMessage(event.delta);
+        pushTypewriterDelta(event.delta);
         return;
       }
       if (event.type === "error") {
+        flushTypewriterAll();
         const errText = "失败：" + (event.error || "未知错误");
         replaceLastAgentMessage(streamedText ? `${streamedText}\n\n${errText}` : errText);
+        updateLastAgentMessageStatus("");
+        clearStreamTimers();
+        streamActive = false;
+        streamInFlightRef.current = false;
         stopListening();
         setChatLoading(false);
         return;
       }
       if (event.type === "done") {
+        flushTypewriterAll();
         const response = event.response as { ok?: boolean; reply?: string; error?: string };
         if (!response?.ok) {
           const errText = "失败：" + (response?.error || "未知错误");
@@ -316,6 +508,10 @@ export function PetChatWindow() {
           const finalContent = streamedText || response.reply || "已处理";
           replaceLastAgentMessage(finalContent);
         }
+        updateLastAgentMessageStatus("");
+        clearStreamTimers();
+        streamActive = false;
+        streamInFlightRef.current = false;
         stopListening();
         setChatLoading(false);
       }
@@ -324,13 +520,22 @@ export function PetChatWindow() {
     try {
       const started = await window.petChatApi.startChatStream(text, history);
       if (!started || !started.ok || !started.chatId) {
+        clearStreamTimers();
+        streamActive = false;
+        streamInFlightRef.current = false;
         stopListening();
         replaceLastAgentMessage("失败：" + (started?.error || "无法启动流式输出"));
         setChatLoading(false);
         return;
       }
       startedChatId = started.chatId;
+      updateLastAgentMessageStatus("正在处理...");
+      streamLastActivityAt = Date.now();
+      startWatchdog(stopListening);
     } catch (err) {
+      clearStreamTimers();
+      streamActive = false;
+      streamInFlightRef.current = false;
       stopListening();
       replaceLastAgentMessage(`失败：${err instanceof Error ? err.message : String(err)}`);
       setChatLoading(false);
@@ -512,7 +717,16 @@ export function PetChatWindow() {
         {messages.map((message, index) => (
           <div key={`${message.role}-${index}`} className={`pet-chat-msg ${message.role}`}>
             <div className="pet-chat-msg-role">{message.role === "user" ? "你" : "助手"}</div>
-            {message.content}
+            {message.role === "agent" ? (
+              <div className="pet-chat-msg-content">
+                {message.status ? <div className="pet-chat-status">{message.status}</div> : null}
+                <div className="markdown-content">
+                  <MarkdownRenderer content={message.content} />
+                </div>
+              </div>
+            ) : (
+              message.content
+            )}
           </div>
         ))}
         <div ref={chatEndRef} />
