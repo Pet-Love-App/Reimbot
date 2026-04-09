@@ -293,6 +293,28 @@ class TestRuleQATools(unittest.TestCase):
         self.assertIn("海外实践", ans_res.data["answer"])
         self.assertEqual(ans_res.data["citations"][0]["category"], "海外实践")
 
+    def test_answer_generate_returns_direct_answer_with_citation_labels(self) -> None:
+        ans_res = answer_generate(
+            "学生国内实践差旅报销所需材料有哪些",
+            [
+                {
+                    "title": "书院财务报销规范-苗霖霖-202508-片段9",
+                    "source": "书院财务报销规范-苗霖霖-202508.pptx",
+                    "content": "三、学生国内实践差旅报销所需材料。交通费用：机票行程单或者机票发票、火车票。住宿费：发票及住宿水单。交通意外保险发票。租车费。",
+                    "score": 0.93,
+                    "category": "国内+思政实践",
+                    "doc_type": "pptx",
+                }
+            ],
+            min_score=0.55,
+            intent="policy",
+        )
+        self.assertTrue(ans_res.success)
+        self.assertIn("交通费用", ans_res.data["answer"])
+        self.assertIn("住宿费", ans_res.data["answer"])
+        self.assertIn("参考：书院财务报销规范-苗霖霖-202508.pptx", ans_res.data["answer"])
+        self.assertNotIn("请参考", ans_res.data["answer"])
+
     def test_build_workflow_hint(self) -> None:
         finance_hint = build_workflow_hint("帮我处理财务报销并自动填表")
         self.assertIsNotNone(finance_hint)

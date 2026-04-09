@@ -84,6 +84,10 @@ export default function App() {
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const scrollRafRef = useRef<number | null>(null);
   const lastSyncedMessagesRef = useRef<string>("");
+  const latestMessagesRef = useRef<ChatMessage[]>([DEFAULT_CHAT_MESSAGE]);
+  const chatHistoryVersionRef = useRef(0);
+  const streamInFlightRef = useRef(false);
+  const chatHistorySaveTimerRef = useRef<number | null>(null);
   const [rootDir, setRootDir] = useState<string | null>(null);
   const [treeNodes, setTreeNodes] = useState<FileTreeNode[]>([]);
   const [expandedPaths, setExpandedPaths] = useState<string[]>([]);
@@ -134,6 +138,26 @@ export default function App() {
   const typewriterPendingRef = useRef("");
   const typewriterTimerRef = useRef<number | null>(null);
   const typewriterRunningRef = useRef(false);
+
+  const extractHistoryEnvelope = (
+    payload: unknown
+  ): { history: ChatMessage[]; version?: number } | null => {
+    if (Array.isArray(payload)) {
+      return { history: payload as ChatMessage[] };
+    }
+    if (!payload || typeof payload !== "object") {
+      return null;
+    }
+    const envelope = payload as { history?: unknown; version?: unknown };
+    if (!Array.isArray(envelope.history)) {
+      return null;
+    }
+    const version = Number(envelope.version);
+    return {
+      history: envelope.history as ChatMessage[],
+      version: Number.isFinite(version) ? version : undefined,
+    };
+  };
 
   useEffect(() => {
     try {
@@ -190,6 +214,10 @@ export default function App() {
       }
     };
   }, [messages, chatLoading]);
+
+  useEffect(() => {
+    latestMessagesRef.current = messages;
+  }, [messages]);
   const [error, setError] = useState<string | null>(
     bridgeReady
       ? null
@@ -270,25 +298,47 @@ export default function App() {
       return;
     }
 
+    let unsubscribeWorkspace: (() => void) | null = null;
+
+    const loadRootTree = async (dir: string) => {
+      setRootDir(dir);
+      setExpandedPaths([]);
+      const result = await bridge.listDir(dir);
+      if (result?.ok && Array.isArray(result.entries)) {
+        setTreeNodes(result.entries.map((entry: FileTreeNode) => ({ ...entry, loaded: false })));
+      } else {
+        setTreeNodes([]);
+      }
+    };
+
     const hydrateRoot = async () => {
       try {
         setTreeLoading(true);
-        const dir = await bridge.getProjectDir();
+        const boundDir =
+          typeof bridge.getWorkspaceDir === "function" ? await bridge.getWorkspaceDir() : null;
+        const dir = boundDir || (await bridge.getProjectDir());
         if (dir) {
-          setRootDir(dir);
-          const result = await bridge.listDir(dir);
-          if (result?.ok && Array.isArray(result.entries)) {
-            setTreeNodes(result.entries.map((entry: FileTreeNode) => ({ ...entry, loaded: false })));
-          } else {
-            setTreeNodes([]);
-          }
+          await loadRootTree(dir);
         }
       } finally {
         setTreeLoading(false);
       }
     };
 
+    if (typeof bridge.subscribeWorkspaceUpdate === "function") {
+      unsubscribeWorkspace = bridge.subscribeWorkspaceUpdate((dir) => {
+        if (!dir) return;
+        setTreeLoading(true);
+        void loadRootTree(dir).finally(() => {
+          setTreeLoading(false);
+        });
+      });
+    }
+
     void hydrateRoot();
+    return () => {
+      if (unsubscribeWorkspace) unsubscribeWorkspace();
+    };
   }, [bridge]);
 
   const updateTreeNode = (
@@ -423,6 +473,13 @@ export default function App() {
     return () => window.clearInterval(timer);
   }, [rootDir, bridge, expandedPaths]);
 
+  useEffect(() => {
+    if (!rootDir || !bridge || typeof bridge.setWorkspaceDir !== "function") {
+      return;
+    }
+    void bridge.setWorkspaceDir(rootDir);
+  }, [rootDir, bridge]);
+
   const renderTreeNodes = (nodes: FileTreeNode[], depth = 0) => {
     return nodes.map((node) => {
       const isExpanded = expandedPaths.includes(node.path);
@@ -466,23 +523,51 @@ export default function App() {
     let unsubscribe: (() => void) | null = null;
 
     const hydrateHistory = async () => {
-      const history = (await bridge.getChatHistory()) as ChatMessage[] | undefined;
+      const historyPayload = await bridge.getChatHistory();
+      const parsed = extractHistoryEnvelope(historyPayload);
+      const history = parsed?.history;
+      if (typeof parsed?.version === "number") {
+        chatHistoryVersionRef.current = parsed.version;
+      }
       if (Array.isArray(history) && history.length > 0) {
-        lastSyncedMessagesRef.current = JSON.stringify(history);
+        const serialized = JSON.stringify(history);
+        lastSyncedMessagesRef.current = serialized;
+        latestMessagesRef.current = history;
         setMessages(history);
       } else {
-        lastSyncedMessagesRef.current = JSON.stringify([DEFAULT_CHAT_MESSAGE]);
-        void bridge.setChatHistory([DEFAULT_CHAT_MESSAGE]);
+        const fallback = [DEFAULT_CHAT_MESSAGE];
+        const serialized = JSON.stringify(fallback);
+        lastSyncedMessagesRef.current = serialized;
+        latestMessagesRef.current = fallback;
+        setMessages(fallback);
+        void bridge.setChatHistory(fallback).then((result) => {
+          const version = Number((result as { version?: unknown })?.version);
+          if (Number.isFinite(version)) {
+            chatHistoryVersionRef.current = Math.max(chatHistoryVersionRef.current, version);
+          }
+        });
       }
     };
 
     if (typeof bridge.subscribeChatHistory === "function") {
-      unsubscribe = bridge.subscribeChatHistory((history: unknown) => {
-        if (!Array.isArray(history)) return;
-        const serialized = JSON.stringify(history);
+      unsubscribe = bridge.subscribeChatHistory((payload: unknown) => {
+        const parsed = extractHistoryEnvelope(payload);
+        if (!parsed) return;
+        if (streamInFlightRef.current) return;
+        if (
+          typeof parsed.version === "number" &&
+          parsed.version < chatHistoryVersionRef.current
+        ) {
+          return;
+        }
+        if (typeof parsed.version === "number") {
+          chatHistoryVersionRef.current = parsed.version;
+        }
+        const serialized = JSON.stringify(parsed.history);
         if (serialized === lastSyncedMessagesRef.current) return;
         lastSyncedMessagesRef.current = serialized;
-        setMessages(history as ChatMessage[]);
+        latestMessagesRef.current = parsed.history;
+        setMessages(parsed.history);
       });
     }
 
@@ -496,12 +581,37 @@ export default function App() {
     if (!bridge || typeof bridge.setChatHistory !== "function") {
       return;
     }
+    if (streamInFlightRef.current) {
+      return;
+    }
     const serialized = JSON.stringify(messages);
     if (serialized === lastSyncedMessagesRef.current) {
       return;
     }
-    lastSyncedMessagesRef.current = serialized;
-    void bridge.setChatHistory(messages);
+    if (chatHistorySaveTimerRef.current !== null) {
+      window.clearTimeout(chatHistorySaveTimerRef.current);
+    }
+    chatHistorySaveTimerRef.current = window.setTimeout(() => {
+      const snapshot = latestMessagesRef.current;
+      const snapshotSerialized = JSON.stringify(snapshot);
+      if (snapshotSerialized === lastSyncedMessagesRef.current) {
+        return;
+      }
+      lastSyncedMessagesRef.current = snapshotSerialized;
+      void bridge.setChatHistory(snapshot).then((result) => {
+        const version = Number((result as { version?: unknown })?.version);
+        if (Number.isFinite(version)) {
+          chatHistoryVersionRef.current = Math.max(chatHistoryVersionRef.current, version);
+        }
+      });
+      chatHistorySaveTimerRef.current = null;
+    }, 120);
+    return () => {
+      if (chatHistorySaveTimerRef.current !== null) {
+        window.clearTimeout(chatHistorySaveTimerRef.current);
+        chatHistorySaveTimerRef.current = null;
+      }
+    };
   }, [bridge, messages]);
 
   useEffect(() => {
@@ -620,8 +730,6 @@ export default function App() {
     }
 
     typewriterRunningRef.current = true;
-    const intervalMs = 18;
-    const charsPerTick = 4;
 
     const tick = () => {
       const pending = typewriterPendingRef.current;
@@ -631,6 +739,9 @@ export default function App() {
         return;
       }
 
+      // Adaptive speed avoids visible stalls when upstream emits large chunks.
+      const charsPerTick = pending.length > 240 ? 24 : pending.length > 120 ? 14 : pending.length > 60 ? 8 : 4;
+      const intervalMs = pending.length > 240 ? 8 : pending.length > 120 ? 12 : 16;
       const slice = pending.slice(0, charsPerTick);
       typewriterPendingRef.current = pending.slice(charsPerTick);
       appendToLastAgentMessage(slice);
@@ -926,6 +1037,7 @@ export default function App() {
         typeof bridge.subscribeAgentChatEvent === "function";
 
       if (!supportsStream) {
+        streamInFlightRef.current = false;
         const response = (await (useWorkspaceMode
           ? bridge.chatWithAgent(text, {
               history: historyForAgent,
@@ -965,6 +1077,7 @@ export default function App() {
         return;
       }
 
+      streamInFlightRef.current = true;
       setMessages((prev) => [...prev, { role: "agent", content: "", status: "正在连接 Agent..." }]);
 
       let startedChatId = "";
@@ -991,18 +1104,19 @@ export default function App() {
         }
 
         if (event.type === "error") {
-          stopTypewriter();
+          flushTypewriterAll();
           const friendly = buildFriendlyError(event.error || "未知错误");
           const errText = friendly.detail;
           replaceLastAgentMessage(streamedText ? `${streamedText}\n\n${errText}` : errText);
           updateLastAgentMessageStatus("");
           updateTaskHistory(historyId, { status: "failed", error: friendly.short });
+          streamInFlightRef.current = false;
           stopListening();
           setChatLoading(false);
           return;
         }
 
-        stopTypewriter();
+        flushTypewriterAll();
 
         const response = event.response as AgentChatResponse;
         if (!response.ok) {
@@ -1026,6 +1140,7 @@ export default function App() {
         updateTaskHistory(historyId, { status: "success", error: undefined });
         replaceLastAgentMessage(finalContent);
         updateLastAgentMessageStatus("");
+        streamInFlightRef.current = false;
         stopListening();
         setChatLoading(false);
       });
@@ -1053,6 +1168,8 @@ export default function App() {
         throw startErr;
       }
     } catch (err) {
+      streamInFlightRef.current = false;
+      stopTypewriter();
       const friendly = buildFriendlyError(err instanceof Error ? err.message : String(err));
       const errText = friendly.detail;
       updateTaskHistory(historyId, {

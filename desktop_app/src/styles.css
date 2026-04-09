@@ -256,7 +256,6 @@ body[data-theme="dark"] .pet-chat-badge.warn {
   line-height: 1.5;
   border-radius: 12px;
   padding: 10px 14px;
-  white-space: pre-wrap;
   word-wrap: break-word;
   box-shadow: var(--shadow-sm);
   max-width: 85%;
@@ -275,6 +274,7 @@ body[data-theme="dark"] .pet-chat-badge.warn {
   border-color: rgba(30, 58, 138, 0.4);
   align-self: flex-end;
   border-bottom-right-radius: 4px;
+  white-space: pre-wrap;
 }
 
 .pet-chat-msg.agent {
@@ -283,6 +283,25 @@ body[data-theme="dark"] .pet-chat-badge.warn {
   color: var(--text-main);
   align-self: flex-start;
   border-bottom-left-radius: 4px;
+}
+
+.pet-chat-msg-content .markdown-content {
+  font-size: 13px;
+  line-height: 1.55;
+}
+
+.pet-chat-msg-content .markdown-content p {
+  margin-bottom: 0.65em;
+}
+
+.pet-chat-msg-content .markdown-content > :last-child {
+  margin-bottom: 0;
+}
+
+.pet-chat-status {
+  margin-bottom: 8px;
+  font-size: 11px;
+  color: var(--text-muted);
 }
 
 .pet-chat-input {

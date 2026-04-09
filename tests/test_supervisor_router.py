@@ -81,7 +81,16 @@ class TestSupervisorRouter(unittest.TestCase):
                         {"month": "2026-02", "amount": 900},
                     ]
                 },
-                "recon_policy": {"abs_threshold": 50, "pct_threshold": 0.05},
+                "recon_policy": {
+                    "abs_threshold": 50,
+                    "pct_threshold": 0.05,
+                    "suggestion_rules": [
+                        {
+                            "reason_contains": ["阈值"],
+                            "suggestion": "请先复核阈值相关差异。",
+                        }
+                    ],
+                },
             },
             "errors": [],
             "task_progress": [],
@@ -93,6 +102,8 @@ class TestSupervisorRouter(unittest.TestCase):
         summary = result.get("summary", {})
         self.assertGreaterEqual(int(summary.get("total_items", 0)), 2)
         self.assertGreaterEqual(int(summary.get("warning", 0)) + int(summary.get("blocking", 0)), 1)
+        self.assertIsInstance(result.get("suggestion_rules"), list)
+        self.assertEqual(result.get("suggestion_rules")[0].get("suggestion"), "请先复核阈值相关差异。")
 
     def test_recon_result_needs_clarification_when_no_data(self) -> None:
         state = {

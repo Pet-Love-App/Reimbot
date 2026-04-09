@@ -33,6 +33,7 @@ const DEFAULT_CHAT_SESSION_TITLE = "新会话";
 let legacySharedChatHistory: SharedChatMessage[] = [];
 let sharedChatSessions: ChatSession[] = [];
 let activeChatSessionId: string | null = null;
+let chatHistoryVersion = 0;
 let watcher: FSWatcher | null = null;
 let currentFilePath: string | null = null;
 const activeChatProcesses = new Map<string, ReturnType<typeof spawn>>();
@@ -594,20 +595,39 @@ function createPetChatWindow(): void {
 }
 
 function emitWorkspaceUpdated(): void {
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    mainWindow.webContents.send("pet:workspace-updated", petWorkspaceDir);
+  }
   if (petChatWindow && !petChatWindow.isDestroyed()) {
     petChatWindow.webContents.send("pet:workspace-updated", petWorkspaceDir);
   }
 }
 
+function setBoundWorkspaceDir(dir: string): string {
+  const normalized = path.resolve(dir);
+  petWorkspaceDir = normalized;
+  emitWorkspaceUpdated();
+  return normalized;
+}
+
 function emitChatHistoryUpdate(): void {
   const activeSession = getActiveChatSession();
   const history = activeSession?.history ?? [];
+  const payload = {
+    history,
+    version: chatHistoryVersion,
+  };
   if (mainWindow && !mainWindow.isDestroyed()) {
-    mainWindow.webContents.send("chat:history:update", history);
+    mainWindow.webContents.send("chat:history:update", payload);
   }
   if (petChatWindow && !petChatWindow.isDestroyed()) {
-    petChatWindow.webContents.send("chat:history:update", history);
+    petChatWindow.webContents.send("chat:history:update", payload);
   }
+}
+
+function bumpChatHistoryVersion(): number {
+  chatHistoryVersion += 1;
+  return chatHistoryVersion;
 }
 
 type ChatSessionMeta = {
@@ -877,6 +897,24 @@ function resolveDefaultBoundDir(): string | null {
   return null;
 }
 
+function ensurePetWorkspaceDir(): string | null {
+  if (petWorkspaceDir) {
+    try {
+      if (fs.statSync(petWorkspaceDir).isDirectory()) {
+        return petWorkspaceDir;
+      }
+    } catch {
+      petWorkspaceDir = null;
+    }
+  }
+  const fallback = resolveDefaultBoundDir();
+  if (!fallback) {
+    return null;
+  }
+  petWorkspaceDir = path.resolve(fallback);
+  return petWorkspaceDir;
+}
+
 function ensureCompareBoundDir(): string | null {
   if (compareBoundDir) {
     try {
@@ -992,7 +1030,8 @@ ipcMain.handle("template:open", async () => {
   return currentFilePath;
 });
 ipcMain.handle("template:getProjectDir", () => {
-  return isDev ? path.join(app.getAppPath(), "..") : path.join(app.getAppPath(), "..", "..");
+  const bound = ensurePetWorkspaceDir();
+  return bound ?? "";
 });
 
 ipcMain.handle("template:pickDir", async () => {
@@ -1005,7 +1044,11 @@ ipcMain.handle("template:pickDir", async () => {
   if (result.canceled || result.filePaths.length === 0) {
     return { ok: false, message: "已取消" };
   }
-  return { ok: true, dir: result.filePaths[0] };
+  const dir = normalizeWorkspaceDir(result.filePaths[0]);
+  if (!dir) {
+    return { ok: false, message: "目录无效" };
+  }
+  return { ok: true, dir: setBoundWorkspaceDir(dir) };
 });
 
 ipcMain.handle("template:listDir", async (_event, targetDir: string) => {
@@ -1779,7 +1822,10 @@ ipcMain.handle("agent:chat:stop", async (_event, chatId: string) => {
 
 ipcMain.handle("chat:history:get", async () => {
   ensureChatSessionsInitialized();
-  return getActiveChatSession()?.history ?? [];
+  return {
+    history: getActiveChatSession()?.history ?? [],
+    version: chatHistoryVersion,
+  };
 });
 
 ipcMain.handle("llm:config:get", async () => {
@@ -1807,10 +1853,11 @@ ipcMain.handle(
           session.title = deriveSessionTitleFromHistory(session.history);
         }
       }
+      bumpChatHistoryVersion();
       emitChatHistoryUpdate();
       emitChatSessionsUpdate();
     }
-    return { ok: true };
+    return { ok: true, version: chatHistoryVersion };
   }
 );
 
@@ -1829,6 +1876,7 @@ ipcMain.handle("chat:sessions:create", async (_event, input?: { title?: string }
   if (requestedTitle) {
     session.title = requestedTitle.slice(0, 60);
   }
+  bumpChatHistoryVersion();
   emitChatHistoryUpdate();
   emitChatSessionsUpdate();
   return {
@@ -1846,6 +1894,7 @@ ipcMain.handle("chat:sessions:switch", async (_event, sessionId: string) => {
     return { ok: false, error: "会话不存在" };
   }
   activeChatSessionId = session.id;
+  bumpChatHistoryVersion();
   emitChatHistoryUpdate();
   emitChatSessionsUpdate();
   return { ok: true, activeSessionId: session.id, history: session.history };
@@ -1878,6 +1927,7 @@ ipcMain.handle("chat:sessions:delete", async (_event, sessionId: string) => {
     target.title = DEFAULT_CHAT_SESSION_TITLE;
     target.updatedAt = new Date().toISOString();
     activeChatSessionId = target.id;
+    bumpChatHistoryVersion();
     emitChatHistoryUpdate();
     emitChatSessionsUpdate();
     return { ok: true, activeSessionId: target.id, history: target.history };
@@ -1887,6 +1937,7 @@ ipcMain.handle("chat:sessions:delete", async (_event, sessionId: string) => {
   if (!activeChatSessionId || activeChatSessionId === targetId) {
     activeChatSessionId = sharedChatSessions[0]?.id ?? null;
   }
+  bumpChatHistoryVersion();
   emitChatHistoryUpdate();
   emitChatSessionsUpdate();
   return {
@@ -1910,16 +1961,16 @@ ipcMain.handle("pet:openChat", async () => {
   createPetChatWindow();
 });
 
-ipcMain.handle("pet:getWorkspaceDir", async () => petWorkspaceDir);
+ipcMain.handle("pet:getWorkspaceDir", async () => {
+  return ensurePetWorkspaceDir();
+});
 
 ipcMain.handle("pet:setWorkspaceDir", async (_event, droppedPath: string) => {
   const dir = normalizeWorkspaceDir(droppedPath);
   if (!dir) {
     return { ok: false, message: "未识别到有效目录" };
   }
-  petWorkspaceDir = dir;
-  emitWorkspaceUpdated();
-  return { ok: true, dir };
+  return { ok: true, dir: setBoundWorkspaceDir(dir) };
 });
 
 ipcMain.handle("pet:pickWorkspaceDir", async () => {
@@ -1937,9 +1988,7 @@ ipcMain.handle("pet:pickWorkspaceDir", async () => {
     if (!dir) {
       return { ok: false, message: "目录无效" };
     }
-    petWorkspaceDir = dir;
-    emitWorkspaceUpdated();
-    return { ok: true, dir };
+    return { ok: true, dir: setBoundWorkspaceDir(dir) };
   } finally {
     if (petChatWindow && !petChatWindow.isDestroyed()) {
       petChatWindow.setAlwaysOnTop(true, "screen-saver");
@@ -1993,7 +2042,8 @@ ipcMain.handle("pet:chat", async (_event, req: { message: string; history?: Arra
   if (!message) {
     return { ok: false, error: "消息不能为空" };
   }
-  if (!petWorkspaceDir) {
+  const workspaceDir = ensurePetWorkspaceDir();
+  if (!workspaceDir) {
     return { ok: false, error: "请先拖拽文件夹到桌宠，或在对话框中选择目录" };
   }
 
@@ -2001,7 +2051,7 @@ ipcMain.handle("pet:chat", async (_event, req: { message: string; history?: Arra
     message,
     payload: {
       history,
-      workspace_dir: petWorkspaceDir,
+      workspace_dir: workspaceDir,
       workspace_mode: true,
     },
   })) as { ok?: boolean; reply?: string; error?: string };
@@ -2021,7 +2071,8 @@ ipcMain.handle(
     if (!message) {
       return { ok: false, error: "消息不能为空" };
     }
-    if (!petWorkspaceDir) {
+    const workspaceDir = ensurePetWorkspaceDir();
+    if (!workspaceDir) {
       return { ok: false, error: "请先拖拽文件夹到桌宠，或在对话框中选择目录" };
     }
     const chatId = randomUUID();
@@ -2031,7 +2082,7 @@ ipcMain.handle(
         message,
         payload: {
           history,
-          workspace_dir: petWorkspaceDir,
+          workspace_dir: workspaceDir,
           workspace_mode: true,
         },
       },

@@ -109,6 +109,23 @@ def _safe_float(raw: Any, default: float) -> float:
 def _build_recon_result(state: AppState) -> Dict[str, Any]:
     payload = state.get("payload", {})
     recon_policy = payload.get("recon_policy", {}) if isinstance(payload.get("recon_policy", {}), dict) else {}
+    raw_suggestion_rules = recon_policy.get("suggestion_rules", [])
+    suggestion_rules: List[Dict[str, Any]] = []
+    if isinstance(raw_suggestion_rules, list):
+        for item in raw_suggestion_rules[:20]:
+            if not isinstance(item, dict):
+                continue
+            reason_contains = item.get("reason_contains", [])
+            suggestion = str(item.get("suggestion", "")).strip()
+            if not suggestion:
+                continue
+            if isinstance(reason_contains, str):
+                normalized_tokens = [reason_contains.strip()] if reason_contains.strip() else []
+            elif isinstance(reason_contains, list):
+                normalized_tokens = [str(token).strip() for token in reason_contains if str(token).strip()]
+            else:
+                normalized_tokens = []
+            suggestion_rules.append({"reason_contains": normalized_tokens, "suggestion": suggestion})
     abs_threshold = _safe_float(recon_policy.get("abs_threshold", get_policy_value(payload, "recon_abs_threshold", 100)), 100.0)
     pct_threshold = _safe_float(
         recon_policy.get("pct_threshold", get_policy_value(payload, "recon_pct_threshold", 0.05)),
@@ -139,6 +156,7 @@ def _build_recon_result(state: AppState) -> Dict[str, Any]:
                 "abs_block_threshold": abs_block_threshold,
                 "pct_block_threshold": pct_block_threshold,
             },
+            "suggestion_rules": suggestion_rules,
             "errors": state.get("errors", []),
         }
 
@@ -211,6 +229,7 @@ def _build_recon_result(state: AppState) -> Dict[str, Any]:
             "abs_block_threshold": abs_block_threshold,
             "pct_block_threshold": pct_block_threshold,
         },
+        "suggestion_rules": suggestion_rules,
         "differences": differences,
         "blocking_items": blocking,
         "warning_items": warning,

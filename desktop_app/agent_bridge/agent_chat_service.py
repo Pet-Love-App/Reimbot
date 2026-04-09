@@ -862,7 +862,9 @@ def _safe_workspace_target(root: Path, relative_path: str) -> Path:
     return target
 
 
-def _workspace_tree_text(root: Path, *, max_files: int = 120) -> str:
+def _workspace_tree_text(root: Path, *, max_files: Optional[int] = None) -> str:
+    if max_files is None:
+        max_files = _safe_int_env("AGENT_WORKSPACE_TREE_MAX_FILES", 5000, min_value=200)
     rows: List[str] = []
     count = 0
     for current, dirs, files in os.walk(root):
@@ -1930,6 +1932,25 @@ def _format_task_reply(task_type: str, result: Dict[str, Any]) -> str:
             joined_reasons = " ".join(
                 str(item.get("reason", "")) for item in blocking_rows + warning_rows if isinstance(item, dict)
             )
+            custom_rules = result.get("suggestion_rules", [])
+            if isinstance(custom_rules, list):
+                for rule in custom_rules[:12]:
+                    if not isinstance(rule, dict):
+                        continue
+                    reason_contains = rule.get("reason_contains", [])
+                    if isinstance(reason_contains, str):
+                        reason_tokens = [reason_contains]
+                    elif isinstance(reason_contains, list):
+                        reason_tokens = [str(item).strip() for item in reason_contains if str(item).strip()]
+                    else:
+                        reason_tokens = []
+                    suggestion = str(rule.get("suggestion", "")).strip()
+                    if not suggestion:
+                        continue
+                    if reason_tokens and not any(token in joined_reasons for token in reason_tokens):
+                        continue
+                    if suggestion not in suggestions:
+                        suggestions.append(suggestion)
 
             if any("缺少对应项" in str(item.get("reason", "")) for item in blocking_rows if isinstance(item, dict)):
                 suggestions.append("补齐预算或决算缺失项后重新核对，确保主键维度（期间/部门/科目/项目）一致。")

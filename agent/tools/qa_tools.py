@@ -1,6 +1,8 @@
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional
+import re
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from agent.tools.base import ToolResult, ok
 
@@ -58,6 +60,64 @@ def _build_action_tip(domain_label: str) -> str:
         "工作餐报销 餐单（仅校内结算单报销需要填写，电子票据直接系统内添加餐单）": "先确认是否属于校内结算单，再补齐餐单与审批单。",
     }
     return mapping.get(domain_label, "先确认适用场景，再按模板和制度逐项补齐材料。")
+
+
+def _normalize_text(text: str) -> str:
+    return re.sub(r"\s+", " ", str(text or "")).strip()
+
+
+def _extract_query_tokens(question: str) -> List[str]:
+    normalized = _normalize_text(question)
+    if not normalized:
+        return []
+    raw_tokens = re.findall(r"[A-Za-z0-9_]+|[\u4e00-\u9fff]{2,}", normalized)
+    return [token.lower() for token in raw_tokens if len(token.strip()) >= 2]
+
+
+def _citation_label(item: Dict[str, Any]) -> str:
+    source = str(item.get("source", "")).strip()
+    if source:
+        return Path(source.replace("\\", "/")).name or source
+    title = str(item.get("title", "")).strip()
+    return title or "知识库片段"
+
+
+def _split_sentences(content: str) -> List[str]:
+    text = _normalize_text(content)
+    if not text:
+        return []
+    text = re.sub(r"\[Slide\s*\d+\]", " ", text, flags=re.IGNORECASE)
+    parts = re.split(r"[。\n；;!?！？]+", text)
+    return [_normalize_text(part) for part in parts if _normalize_text(part)]
+
+
+def _extract_key_points(question: str, ranked: Sequence[Dict[str, Any]], max_points: int = 5) -> List[Tuple[str, str]]:
+    query_tokens = _extract_query_tokens(question)
+    generic_tokens = ["报销", "材料", "标准", "附件", "发票", "交通", "住宿", "保险", "租车", "实践"]
+    selected: List[Tuple[float, str, str]] = []
+    seen: set[str] = set()
+
+    for item in ranked[:8]:
+        source_name = _citation_label(item)
+        sentences = _split_sentences(str(item.get("content", "")))
+        for sentence in sentences:
+            if len(sentence) < 10 or len(sentence) > 120:
+                continue
+            key = sentence.lower()
+            if key in seen:
+                continue
+            token_hits = sum(1 for token in query_tokens if token and token in key)
+            generic_hits = sum(1 for token in generic_tokens if token in key)
+            if token_hits == 0 and generic_hits == 0:
+                continue
+            score = token_hits * 2 + generic_hits
+            if re.search(r"报销|标准|需|需要|应|可|不得|凭票|附件", sentence):
+                score += 1
+            selected.append((float(score), sentence, source_name))
+            seen.add(key)
+
+    selected.sort(key=lambda row: row[0], reverse=True)
+    return [(sentence, source_name) for _, sentence, source_name in selected[: max(1, max_points)]]
 
 
 def build_workflow_hint(question: str) -> Optional[Dict[str, Any]]:
@@ -123,14 +183,20 @@ def answer_generate(
         )
 
     domain_label = _infer_domain_label(top)
-    top_category = str(top.get("category", "")).strip()
-    action_tip = _build_action_tip(top_category or domain_label)
-    doc_type = str(top.get("doc_type", "")).strip()
-    doc_type_tip = f"（文档类型：{doc_type}）" if doc_type else ""
-    answer = (
-        f"根据本地知识库（分类：{domain_label}），与你问题最相关的是《{top.get('title', '规则片段')}》{doc_type_tip}。"
-        f"建议：{action_tip}"
-    )
+    key_points = _extract_key_points(question, ranked, max_points=5)
+    top_title = str(top.get("title", "规则片段")).strip() or "规则片段"
+    top_source_name = _citation_label(top)
+    if key_points:
+        lines = [
+            f"已结合检索到的制度内容直接回答。核心依据来自《{top_title}》。",
+        ]
+        for idx, (point, source_name) in enumerate(key_points, start=1):
+            lines.append(f"{idx}. {point}（参考：{source_name}）")
+        answer = "\n".join(lines)
+    else:
+        top_category = str(top.get("category", "")).strip()
+        action_tip = _build_action_tip(top_category or domain_label)
+        answer = f"{action_tip}（参考：{top_source_name}）"
     citations = [
         {
             "source": top.get("source", ""),

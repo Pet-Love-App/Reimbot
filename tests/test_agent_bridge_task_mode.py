@@ -329,6 +329,25 @@ class TestAgentBridgeTaskMode(unittest.TestCase):
         self.assertNotIn("B：差额=2", reply)
         self.assertIn("建议处理", reply)
 
+    def test_format_task_reply_for_recon_custom_suggestion_rules(self) -> None:
+        result = {
+            "type": "recon",
+            "status": "warning",
+            "summary": {"total_items": 2, "blocking": 0, "warning": 1, "hint": 0},
+            "warning_items": [
+                {"key": "税率项", "abs_diff": 10, "pct_diff": 0.03, "reason": "税率口径不一致"},
+            ],
+            "suggestion_rules": [
+                {
+                    "reason_contains": ["税率", "口径"],
+                    "suggestion": "请先统一税率与含税口径，再重新执行核对。",
+                }
+            ],
+        }
+        reply = self.bridge._format_task_reply("recon", result)
+        self.assertIn("建议处理", reply)
+        self.assertIn("请先统一税率与含税口径，再重新执行核对。", reply)
+
     def test_format_task_reply_for_recon_clarification(self) -> None:
         result = {
             "type": "recon",
