@@ -837,6 +837,89 @@ def _merge_context_blocks(*blocks: str) -> str:
     return "\n\n".join(cleaned)
 
 
+def _referenced_files_context(payload: Dict[str, Any]) -> str:
+    blocks: List[str] = []
+    raw_files = payload.get("referenced_files", [])
+    if isinstance(raw_files, list) and raw_files:
+        files = [str(item).strip() for item in raw_files if str(item).strip()]
+        if files:
+            blocks.append("用户指定参考文件:\n" + "\n".join(f"- {item}" for item in files[:20]))
+
+    raw_context = str(payload.get("referenced_file_context", "")).strip()
+    if raw_context:
+        blocks.append("用户引用文件内容:\n" + raw_context[:24000])
+
+    return _merge_context_blocks(*blocks)
+
+
+def _referenced_file_paths(payload: Dict[str, Any]) -> List[str]:
+    raw_files = payload.get("referenced_files", [])
+    if not isinstance(raw_files, list):
+        return []
+    return [str(item).strip() for item in raw_files if str(item).strip()]
+
+
+def _resolve_message_with_referenced_file(message: str, payload: Dict[str, Any]) -> str:
+    text = str(message or "").strip()
+    if not text:
+        return text
+    referenced_files = _referenced_file_paths(payload)
+    if len(referenced_files) != 1:
+        return text
+
+    target = referenced_files[0]
+    lowered = text.lower()
+    has_pronoun = any(token in text for token in ("这个文件", "当前文件", "该文件", "这个表", "这个excel"))
+    has_target = target in text or target.lower() in lowered
+    has_file_ext = bool(
+        re.search(
+            r"\.(py|ts|tsx|js|jsx|json|md|txt|yaml|yml|toml|ini|csv|xlsx|xlsm|docx|pdf)\b",
+            text,
+            flags=re.IGNORECASE,
+        )
+    )
+    if has_target or has_file_ext or not has_pronoun:
+        return text
+
+    return f"{text}\n\n用户指代的目标文件是：{target}"
+
+
+def _build_direct_plan_from_single_reference(message: str, payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    text = str(message or "").strip()
+    if not text:
+        return None
+    referenced_files = _referenced_file_paths(payload)
+    if len(referenced_files) != 1:
+        return None
+
+    target = referenced_files[0]
+    lower = text.lower()
+    has_data_intent = any(token in text for token in ("测试数据", "追加", "加入", "新增")) or "append" in lower
+    if not has_data_intent:
+        return None
+
+    if not target.lower().endswith((".xlsx", ".xlsm")):
+        return None
+
+    count_match = re.search(r"(\d+)\s*条", text)
+    count = int(count_match.group(1)) if count_match else 5
+    count = max(1, min(count, 2000))
+    sheet_match = re.search(r"\b(Sheet\d+)\b", text, flags=re.IGNORECASE)
+    requested_sheet = sheet_match.group(1) if sheet_match else "Sheet1"
+    rows = [{"学号": 1000 + i + 1, "姓名": f"测试{i + 1}"} for i in range(count)]
+    return {
+        "reply": f"已按你引用的文件执行：向 {target} 的 {requested_sheet} 追加 {count} 条测试数据。",
+        "actions": [
+            {
+                "action": "xlsx_edit",
+                "path": target,
+                "sheet": requested_sheet,
+                "append_dict_rows": rows,
+            }
+        ],
+    }
+
+
 def _safe_workspace_root(payload: Dict[str, Any]) -> Optional[Path]:
     workspace_raw = str(payload.get("workspace_dir", "")).strip()
     if not workspace_raw:
@@ -1412,6 +1495,7 @@ def _run_workspace_agent(
     payload: Dict[str, Any],
     history: List[Dict[str, str]],
     memory_context: str = "",
+    referenced_context: str = "",
 ) -> Dict[str, Any]:
     workspace_root = _safe_workspace_root(payload)
     if workspace_root is None:
@@ -1421,6 +1505,9 @@ def _run_workspace_agent(
         }
 
     directory_tree = _workspace_tree_text(workspace_root)
+    effective_message = _resolve_message_with_referenced_file(message, payload)
+    referenced_files = _referenced_file_paths(payload)
+    resolved_target_hint = referenced_files[0] if len(referenced_files) == 1 else ""
 
     command_plan: Optional[Dict[str, Any]] = None
 
@@ -1440,7 +1527,12 @@ def _run_workspace_agent(
         }
 
     if command_plan is None:
-        command_plan = _parse_workspace_command(message)
+        # Deterministic fast path: when user selected exactly one file with '@',
+        # execute data-append style requests directly to avoid unnecessary path clarification.
+        command_plan = _build_direct_plan_from_single_reference(message, payload)
+
+    if command_plan is None:
+        command_plan = _parse_workspace_command(effective_message)
     if command_plan is not None:
         logs = _workspace_execute_actions(workspace_root, command_plan.get("actions", []))
         if command_plan.get("actions") and command_plan["actions"][0].get("action") == "list_files":
@@ -1477,8 +1569,14 @@ def _run_workspace_agent(
             记忆上下文（可用于保持连续性）:
             {memory_context or '(无)'}
 
+            用户当前引用文件（优先参考）:
+            {referenced_context or '(无)'}
+
+            已解析唯一引用目标:
+            {resolved_target_hint or '(无)'}
+
             用户请求:
-            {message}
+            {effective_message}
 
             先在心里完成以下判断，再输出 JSON：
             - 意图类型：问答 / 读文件 / 改文件 / 列目录 / 其他。
@@ -1491,8 +1589,10 @@ def _run_workspace_agent(
             2) 用户只给文件名（如 main.ts）：
                - 若目录树中唯一命中，可直接操作；
                - 若有多个同名文件，禁止猜测，reply 里列出候选路径并请用户确认，actions 置空。
-            3) 用户说“这个文件/当前文件”但没有可确定路径时，禁止猜测，reply 里明确要求用户提供相对路径，actions 置空。
-            4) 仅当文件可唯一确定时，才允许输出写入类 actions。
+            3) 若“已解析唯一引用目标”不为空，且用户说“这个文件/当前文件”，直接将该目标作为 path。
+            4) 用户说“这个文件/当前文件”但没有可确定路径时，禁止猜测，reply 里明确要求用户提供相对路径，actions 置空。
+            5) 仅当文件可唯一确定时，才允许输出写入类 actions。
+            6) 若“已解析唯一引用目标”不为空，不要再向用户追问路径，直接执行或仅追问业务字段。
 
             请仅返回 JSON 对象，不要加解释文字。格式：
             {{
@@ -1701,9 +1801,9 @@ def _route_request_mode(message: str, payload: Dict[str, Any]) -> Tuple[str, Opt
     if override_mode == "task":
         return "task", task_type, task_payload
     if override_mode == "workspace":
-        return "workspace", None, payload
+        return "task", "file_edit", payload
     if override_mode == "chat":
-        return "chat", None, payload
+        return "task", "auto", payload
 
     if task_type:
         return "task", task_type, task_payload
@@ -1721,7 +1821,7 @@ def _route_request_mode(message: str, payload: Dict[str, Any]) -> Tuple[str, Opt
                     "reason_codes": reason_codes,
                 },
             }
-            return "workspace", None, enriched_payload
+            return "task", "file_edit", enriched_payload
         if inferred_task and confidence >= 0.84:
             enriched_payload = {
                 **payload,
@@ -1736,9 +1836,51 @@ def _route_request_mode(message: str, payload: Dict[str, Any]) -> Tuple[str, Opt
     workspace_mode = bool(payload.get("workspace_mode", False))
     workspace_task = str(payload.get("workspace_task", "")).strip()
     if workspace_mode and (workspace_task or _looks_like_workspace_intent(message)):
-        return "workspace", None, payload
+        return "task", "file_edit", payload
 
-    return "chat", None, payload
+    return "task", "auto", payload
+
+
+def _prepare_task_payload_for_dispatch(
+    message: str,
+    base_payload: Dict[str, Any],
+    task_payload: Dict[str, Any],
+    task_type: str,
+) -> Dict[str, Any]:
+    merged_payload: Dict[str, Any] = {}
+    if isinstance(base_payload, dict):
+        merged_payload.update(base_payload)
+    if isinstance(task_payload, dict):
+        merged_payload.update(task_payload)
+
+    merged_payload["query"] = str(merged_payload.get("query", "")).strip() or str(message or "").strip()
+
+    workspace_dir = str(
+        merged_payload.get("workspace_dir", "") or merged_payload.get("workspace_root", "")
+    ).strip()
+    if workspace_dir:
+        merged_payload["workspace_dir"] = workspace_dir
+        merged_payload.setdefault("workspace_root", workspace_dir)
+
+    if task_type == "file_edit":
+        effective_message = _resolve_message_with_referenced_file(message, merged_payload)
+        if not isinstance(merged_payload.get("actions"), list) or not merged_payload.get("actions"):
+            command_plan = _build_direct_plan_from_single_reference(message, merged_payload)
+            if command_plan is None:
+                command_plan = _parse_workspace_command(effective_message)
+            if isinstance(command_plan, dict):
+                actions = command_plan.get("actions", [])
+                if isinstance(actions, list):
+                    merged_payload["actions"] = [item for item in actions if isinstance(item, dict)]
+
+        policy = merged_payload.get("policy", {})
+        if not isinstance(policy, dict):
+            policy = {}
+        if "requires_confirmation" not in policy:
+            policy["requires_confirmation"] = False
+        merged_payload["policy"] = policy
+
+    return merged_payload
 
 
 def _get_llm_base_url() -> str:
@@ -2190,25 +2332,20 @@ def handle_request_stream(request: Dict[str, Any]) -> Iterator[Dict[str, Any]]:
     if bool(payload.get("memory_reset", False)):
         _reset_memory_session(payload)
     memory_ctx = _memory_context(payload)
+    referenced_ctx = _referenced_files_context(payload)
 
     route_mode, task_type, task_payload = _route_request_mode(message, payload)
 
-    if route_mode == "workspace":
-        yield {"type": "status", "status": "正在处理目录编辑任务..."}
-        workspace_result = _run_workspace_agent(message, payload, safe_history, memory_context=memory_ctx)
-        if not workspace_result.get("ok", True):
-            yield {"type": "error", "error": str(workspace_result.get("error", "目录任务失败"))}
-            return
-        reply = str(workspace_result.get("reply", "已处理"))
-        _remember_turn(payload, message, reply)
-        for chunk in _iter_text_chunks(reply):
-            yield {"type": "delta", "delta": chunk}
-        yield {"type": "done", "response": {"ok": True, **workspace_result}}
-        return
-
-    if route_mode == "task" and task_type:
-        yield {"type": "status", "status": f"正在执行任务: {task_type}"}
-        task_resp = _run_v2_task(task_type, task_payload)
+    if route_mode == "task":
+        effective_task_type = str(task_type or "").strip() or "auto"
+        prepared_task_payload = _prepare_task_payload_for_dispatch(
+            message=message,
+            base_payload=payload,
+            task_payload=task_payload if isinstance(task_payload, dict) else {},
+            task_type=effective_task_type,
+        )
+        yield {"type": "status", "status": f"正在执行任务: {effective_task_type}"}
+        task_resp = _run_v2_task(effective_task_type, prepared_task_payload)
         for step in task_resp.get("task_progress", []):
             step_name = str(step.get("step", ""))
             tool_name = str(step.get("tool_name", ""))
@@ -2236,7 +2373,7 @@ def handle_request_stream(request: Dict[str, Any]) -> Iterator[Dict[str, Any]]:
 
     if _is_llm_enabled():
         yield {"type": "status", "status": "正在调用 RAG 知识库检索..."}
-        kb_context = _merge_context_blocks(_get_kb_context(message), memory_ctx)
+        kb_context = _merge_context_blocks(_get_kb_context(message), memory_ctx, referenced_ctx)
         yield {"type": "status", "status": "正在生成回答..."}
         streamed_reply = ""
         try:
@@ -2268,16 +2405,19 @@ def handle_request(request: Dict[str, Any]) -> Dict[str, Any]:
     if bool(payload.get("memory_reset", False)):
         _reset_memory_session(payload)
     memory_ctx = _memory_context(payload)
+    referenced_ctx = _referenced_files_context(payload)
 
     route_mode, task_type, task_payload = _route_request_mode(message, payload)
 
-    if route_mode == "workspace":
-        workspace_result = _run_workspace_agent(message, payload, safe_history, memory_context=memory_ctx)
-        _remember_turn(payload, message, str(workspace_result.get("reply", "")))
-        return workspace_result
-
-    if route_mode == "task" and task_type:
-        result = {"ok": True, **_run_v2_task(task_type, task_payload)}
+    if route_mode == "task":
+        effective_task_type = str(task_type or "").strip() or "auto"
+        prepared_task_payload = _prepare_task_payload_for_dispatch(
+            message=message,
+            base_payload=payload,
+            task_payload=task_payload if isinstance(task_payload, dict) else {},
+            task_type=effective_task_type,
+        )
+        result = {"ok": True, **_run_v2_task(effective_task_type, prepared_task_payload)}
         _remember_turn(payload, message, str(result.get("reply", "")))
         return result
 
@@ -2288,7 +2428,7 @@ def handle_request(request: Dict[str, Any]) -> Dict[str, Any]:
         return result
 
     if _is_llm_enabled():
-        kb_context = _merge_context_blocks(_get_kb_context(message), memory_ctx)
+        kb_context = _merge_context_blocks(_get_kb_context(message), memory_ctx, referenced_ctx)
         llm_reply = _llm_chat(message=message, history=safe_history, kb_context=kb_context)
         _remember_turn(payload, message, llm_reply)
         return {"ok": True, "reply": llm_reply, "mode": "llm"}

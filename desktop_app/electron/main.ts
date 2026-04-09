@@ -750,6 +750,62 @@ function normalizeWorkspaceDir(candidatePath: string): string | null {
   }
 }
 
+function listWorkspaceFiles(rootDir: string): Array<{ name: string; path: string; relativePath: string }> {
+  const files: Array<{ name: string; path: string; relativePath: string }> = [];
+  const stack: Array<{ dir: string; depth: number }> = [{ dir: rootDir, depth: 0 }];
+  const maxDepth = 12;
+  const maxCount = 10000;
+  const skipDirs = new Set([
+    ".git",
+    ".idea",
+    ".vscode",
+    "node_modules",
+    "dist",
+    "build",
+    "__pycache__",
+    ".venv",
+    "venv",
+  ]);
+
+  while (stack.length > 0 && files.length < maxCount) {
+    const current = stack.pop();
+    if (!current) {
+      break;
+    }
+    let entries: fs.Dirent[] = [];
+    try {
+      entries = fs.readdirSync(current.dir, { withFileTypes: true });
+    } catch {
+      continue;
+    }
+
+    for (const entry of entries) {
+      if (entry.name.startsWith(".")) {
+        continue;
+      }
+      const fullPath = path.join(current.dir, entry.name);
+      if (entry.isDirectory()) {
+        if (current.depth < maxDepth && !skipDirs.has(entry.name)) {
+          stack.push({ dir: fullPath, depth: current.depth + 1 });
+        }
+        continue;
+      }
+      if (!entry.isFile()) {
+        continue;
+      }
+      try {
+        const relativePath = path.relative(rootDir, fullPath).replace(/\\/g, "/");
+        files.push({ name: entry.name, path: fullPath, relativePath });
+      } catch {
+        // ignore file path normalization failures
+      }
+    }
+  }
+
+  files.sort((a, b) => a.relativePath.localeCompare(b.relativePath, "zh-Hans-CN"));
+  return files;
+}
+
 function normalizeExcelCellValue(raw: string): string | number | boolean {
   const text = String(raw ?? "");
   const trimmed = text.trim();
@@ -1075,6 +1131,22 @@ ipcMain.handle("template:listDir", async (_event, targetDir: string) => {
       });
 
     return { ok: true, entries };
+  } catch (err) {
+    return { ok: false, error: err instanceof Error ? err.message : String(err) };
+  }
+});
+
+ipcMain.handle("template:listWorkspaceFiles", async (_event, targetDir: string) => {
+  const dirPath = String(targetDir ?? "").trim();
+  if (!dirPath) {
+    return { ok: false, error: "目录不能为空" };
+  }
+  try {
+    const stat = fs.statSync(dirPath);
+    if (!stat.isDirectory()) {
+      return { ok: false, error: "目标不是目录" };
+    }
+    return { ok: true, files: listWorkspaceFiles(path.resolve(dirPath)) };
   } catch (err) {
     return { ok: false, error: err instanceof Error ? err.message : String(err) };
   }

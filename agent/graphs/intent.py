@@ -33,6 +33,8 @@ def _to_bool(raw: Any) -> bool:
 
 def _normalize_explicit_task(task_type: str) -> str:
     text = str(task_type or "").strip().lower()
+    if text in {"", "auto"}:
+        return ""
     alias_map = {
         "t1_qa": TASK_QA,
         "t2_recon": TASK_RECON,
@@ -51,7 +53,7 @@ def _normalize_explicit_task(task_type: str) -> str:
         "budget_fill": TASK_BUDGET_FILL,
         "final_fill": TASK_FINAL_FILL,
     }
-    return alias_map.get(text, text)
+    return alias_map.get(text, "")
 
 
 def _classify_task(query: str, payload: Dict[str, Any]) -> Tuple[str, float, List[str]]:

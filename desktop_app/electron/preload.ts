@@ -133,6 +133,13 @@ const api = {
     dirPath: string
   ): Promise<{ ok: boolean; entries?: Array<{ name: string; path: string; isDir: boolean }>; error?: string }> =>
     ipcRenderer.invoke("template:listDir", dirPath),
+  listWorkspaceFiles: async (
+    dirPath: string
+  ): Promise<{
+    ok: boolean;
+    files?: Array<{ name: string; path: string; relativePath: string }>;
+    error?: string;
+  }> => ipcRenderer.invoke("template:listWorkspaceFiles", dirPath),
   readFile: async (targetPath: string): Promise<unknown> => ipcRenderer.invoke("template:readFile", targetPath),
   writeFile: async (
     targetPath: string,
