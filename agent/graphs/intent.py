@@ -26,6 +26,7 @@ TASK_RECON = "recon"
 TASK_MATERIAL = "material"
 TASK_BUDGET_FILL = "budget_fill"
 TASK_FINAL_FILL = "final_fill"
+HIGH_RISK_FILE_ACTIONS = {"write_file", "append_file", "replace_text", "xlsx_edit", "material_package"}
 
 
 def _append_reason(reasons: List[str], code: str) -> None:
@@ -210,7 +211,12 @@ def intent_node(state: AppState) -> AppState:
     runtime_task = _to_runtime_task(inferred_task)
     is_write_task = inferred_task in {TASK_FILE_EDIT, TASK_BUDGET_FILL, TASK_FINAL_FILL, TASK_MATERIAL}
     risk_level = "high" if is_write_task else "medium"
-    requires_confirmation = is_write_task and confidence >= 0.8
+    actions = payload.get("actions", [])
+    safe_actions = [item for item in actions if isinstance(item, dict)] if isinstance(actions, list) else []
+    has_high_risk_actions = any(
+        str(item.get("action", "")).strip() in HIGH_RISK_FILE_ACTIONS for item in safe_actions
+    )
+    requires_confirmation = is_write_task and confidence >= 0.8 and has_high_risk_actions
     next_payload = _with_confirmation_policy(payload, requires_confirmation=requires_confirmation)
 
     return {

@@ -357,6 +357,55 @@ class TestAgentBridgeTaskMode(unittest.TestCase):
         reply = self.bridge._format_task_reply("recon", result)
         self.assertEqual(reply, "请补充预算与决算数据")
 
+    def test_run_audit_uses_v2_dispatcher_and_returns_compatible_report(self) -> None:
+        fake_recon_result = {
+            "type": "recon",
+            "status": "warning",
+            "summary": {"total_items": 3, "blocking": 1, "warning": 1, "hint": 0},
+            "differences": [
+                {"key": "2026-01|交通费", "abs_diff": 1200, "pct_diff": 0.2, "reason": "超出阻断阈值"},
+                {"key": "2026-02|物料费", "abs_diff": 80, "pct_diff": 0.06, "reason": "超出预警阈值"},
+            ],
+            "blocking_items": [
+                {"key": "2026-01|交通费", "abs_diff": 1200, "pct_diff": 0.2, "reason": "超出阻断阈值"}
+            ],
+            "warning_items": [
+                {"key": "2026-02|物料费", "abs_diff": 80, "pct_diff": 0.06, "reason": "超出预警阈值"}
+            ],
+            "errors": [],
+        }
+        with patch("agent.core.dispatcher.TaskDispatcher.dispatch", return_value=fake_recon_result):
+            result = self.bridge._run_audit(
+                budget_source={"rows": [{"month": "2026-01", "amount": 1000}]},
+                actual_source={"rows": [{"month": "2026-01", "amount": 2200}]},
+            )
+
+        self.assertIn("审计完成", str(result.get("reply", "")))
+        report_json = result.get("report_json", {})
+        self.assertEqual(report_json.get("summary", {}).get("overall_status"), "WARNING")
+        self.assertEqual(int(report_json.get("summary", {}).get("high_risk_issues", 0)), 1)
+        self.assertEqual(len(report_json.get("discrepancies", [])), 2)
+        self.assertIn("预算/决算核对报告", str(result.get("report_markdown", "")))
+
+    def test_format_task_reply_for_confirmation(self) -> None:
+        result = {
+            "type": "confirmation",
+            "status": "pending_confirmation",
+            "message": "检测到高风险写操作，请先确认。",
+        }
+        reply = self.bridge._format_task_reply("auto", result)
+        self.assertEqual(reply, "检测到高风险写操作，请先确认。")
+
+    def test_format_task_reply_for_file_edit_needs_clarification(self) -> None:
+        result = {
+            "type": "file_edit",
+            "status": "needs_clarification",
+            "message": "未检测到可执行文件操作，请补充目标文件路径与具体修改内容后重试。",
+            "changeset": [],
+        }
+        reply = self.bridge._format_task_reply("auto", result)
+        self.assertIn("补充目标文件路径", reply)
+
     def test_supervisor_auto_routes_file_edit_to_workspace_mode(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             root = Path(tmp_dir)

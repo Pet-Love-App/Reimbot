@@ -137,8 +137,40 @@ class TestSupervisorRouter(unittest.TestCase):
         }
         updated = intent_node(state)
         policy = updated.get("payload", {}).get("policy", {})
-        self.assertTrue(bool(policy.get("requires_confirmation")))
+        self.assertFalse(bool(policy.get("requires_confirmation")))
         self.assertFalse(bool(policy.get("confirmed")))
+
+    def test_intent_node_file_edit_text_samples(self) -> None:
+        samples = [
+            (
+                "把这个文件里面加入5条测试数据",
+                "R602_FILE_EDIT",
+            ),
+            (
+                "AI Agent 任务已完成：auto。请编辑文件并修复任务类型判断。",
+                "R602_FILE_EDIT",
+            ),
+            (
+                "任务结果 任务类型: 报销问答。编辑文件并没有成功，任务类型判断也不正确。",
+                "R602_FILE_EDIT",
+            ),
+            (
+                "请在当前文件追加5条测试数据，并修正路由识别。",
+                "R602_FILE_EDIT",
+            ),
+            (
+                "write_file path=tests/test_supervisor_router.py content=append_cases",
+                "R601_TOOL_ACTION",
+            ),
+        ]
+        for query, expected_reason in samples:
+            with self.subTest(query=query):
+                updated = intent_node({"payload": {"query": query}, "task_progress": []})
+                self.assertEqual(updated.get("task_type"), "file_edit")
+                route_decision = updated.get("route_decision", {})
+                self.assertEqual(route_decision.get("task_type"), "file_edit")
+                self.assertNotEqual(route_decision.get("task_type"), "qa")
+                self.assertIn(expected_reason, route_decision.get("reason_codes", []))
 
     def test_file_edit_gateway_node(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -189,6 +221,23 @@ class TestSupervisorRouter(unittest.TestCase):
             updated = file_edit_gateway_node(state)
             result = updated.get("result", {})
             self.assertEqual(result.get("status"), "pending_confirmation")
+
+    def test_file_edit_gateway_needs_clarification_when_no_actions(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            state = {
+                "payload": {
+                    "workspace_root": str(root),
+                    "operation_id": "op-test-3",
+                },
+                "task_progress": [],
+                "errors": [],
+            }
+            updated = file_edit_gateway_node(state)
+            result = updated.get("result", {})
+            self.assertEqual(result.get("type"), "file_edit")
+            self.assertEqual(result.get("status"), "needs_clarification")
+            self.assertIn("补充目标文件路径", str(result.get("message", "")))
 
     def test_fail_fast_routes(self) -> None:
         self.assertEqual(route_after_scan({"errors": ["scan failed"], "files": []}), "ReimburseFailNode")

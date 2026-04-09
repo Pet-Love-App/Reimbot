@@ -94,6 +94,7 @@ TEXT_EDIT_BLOCKED_SUFFIXES = {
 }
 
 XLSX_EDIT_SUFFIXES = {".xlsx", ".xlsm"}
+HIGH_RISK_FILE_ACTIONS = {"write_file", "append_file", "replace_text", "xlsx_edit", "material_package"}
 
 DEFAULT_REIMBURSE_CATEGORY_KEYWORDS: Dict[str, Set[str]] = {
     "报销单": {"报销单", "报销申请", "报销", "reimburse"},
@@ -1856,8 +1857,16 @@ def _prepare_task_payload_for_dispatch(
         policy = merged_payload.get("policy", {})
         if not isinstance(policy, dict):
             policy = {}
+        safe_actions = (
+            [item for item in merged_payload.get("actions", []) if isinstance(item, dict)]
+            if isinstance(merged_payload.get("actions", []), list)
+            else []
+        )
+        inferred_requires_confirmation = any(
+            str(item.get("action", "")).strip() in HIGH_RISK_FILE_ACTIONS for item in safe_actions
+        )
         if "requires_confirmation" not in policy:
-            policy["requires_confirmation"] = True
+            policy["requires_confirmation"] = inferred_requires_confirmation
         merged_payload["policy"] = policy
 
     return merged_payload
@@ -1972,31 +1981,90 @@ def _rule_reply(message: str, payload: Dict[str, Any]) -> Optional[Dict[str, Any
 
 def _brief_report(report_json: Dict[str, Any]) -> str:
     summary = report_json.get("summary", {})
-    total = summary.get("total_issues", 0)
-    high = summary.get("high_risk_issues", 0)
-    status = summary.get("overall_status", "UNKNOWN")
+    total = int(summary.get("total_issues", summary.get("total_items", 0)) or 0)
+    high = int(summary.get("high_risk_issues", summary.get("blocking_items", 0)) or 0)
+    status = str(summary.get("overall_status", "UNKNOWN"))
     return f"审计完成：状态={status}，问题总数={total}，高风险={high}。"
+
+
+def _recon_to_report_json(recon_result: Dict[str, Any]) -> Dict[str, Any]:
+    summary = recon_result.get("summary", {}) if isinstance(recon_result.get("summary", {}), dict) else {}
+    total_items = int(summary.get("total_items", 0) or 0)
+    blocking = int(summary.get("blocking", 0) or 0)
+    warning = int(summary.get("warning", 0) or 0)
+    hint = int(summary.get("hint", 0) or 0)
+    status = str(recon_result.get("status", "unknown")).upper()
+    differences = recon_result.get("differences", [])
+    return {
+        "summary": {
+            "overall_status": status,
+            "total_items": total_items,
+            "blocking_items": blocking,
+            "warning_items": warning,
+            "hint_items": hint,
+            "total_issues": blocking + warning + hint,
+            "high_risk_issues": blocking,
+        },
+        "thresholds": recon_result.get("thresholds", {}),
+        "discrepancies": differences if isinstance(differences, list) else [],
+        "blocking_items": recon_result.get("blocking_items", []),
+        "warning_items": recon_result.get("warning_items", []),
+        "hint_items": recon_result.get("hint_items", []),
+        "suggestion_rules": recon_result.get("suggestion_rules", []),
+        "errors": recon_result.get("errors", []),
+    }
+
+
+def _recon_to_report_markdown(recon_result: Dict[str, Any]) -> str:
+    status = str(recon_result.get("status", "unknown"))
+    if status == "needs_clarification":
+        message = str(recon_result.get("message", "")).strip() or "缺少核对数据，请补充预算与决算数据后重试。"
+        return f"# 预算/决算核对报告\n\n{message}"
+
+    summary = recon_result.get("summary", {}) if isinstance(recon_result.get("summary", {}), dict) else {}
+    total_items = int(summary.get("total_items", 0) or 0)
+    blocking = int(summary.get("blocking", 0) or 0)
+    warning = int(summary.get("warning", 0) or 0)
+    hint = int(summary.get("hint", 0) or 0)
+    lines = [
+        "# 预算/决算核对报告",
+        "",
+        f"- 状态：{status}",
+        f"- 核对总项：{total_items}",
+        f"- 阻断：{blocking}",
+        f"- 预警：{warning}",
+        f"- 提示：{hint}",
+    ]
+    blocking_items = recon_result.get("blocking_items", [])
+    if isinstance(blocking_items, list) and blocking_items:
+        lines.extend(["", "## 阻断项（前 3 条）"])
+        for item in blocking_items[:3]:
+            if not isinstance(item, dict):
+                continue
+            key = str(item.get("key", "未命名项"))
+            abs_diff = item.get("abs_diff", 0)
+            pct_diff = item.get("pct_diff", 0)
+            reason = str(item.get("reason", ""))
+            lines.append(f"- {key}：差额={abs_diff}，差异率={pct_diff}，原因={reason}")
+    return "\n".join(lines)
 
 
 def _run_audit(budget_source: Any, actual_source: Any) -> Dict[str, Any]:
     try:
-        from agent.graph_builder import build_graph  # noqa: WPS433
+        from agent import EventBus, TaskDispatcher  # noqa: WPS433
     except ModuleNotFoundError as exc:
         raise RuntimeError(
             "审计模式依赖缺失，请在当前 Python 环境安装 requirements.txt（含 pandas/langgraph/jsonschema）。"
         ) from exc
 
-    app = build_graph()
-    state: Dict[str, Any] = {
+    payload: Dict[str, Any] = {
         "budget_source": budget_source,
         "actual_source": actual_source,
-        "discrepancies": [],
-        "suggestions": [],
     }
-    result = app.invoke(state)
-    report = result.get("report", {})
-    report_json = report.get("report_json", {})
-    report_markdown = report.get("report_markdown", "")
+    dispatcher = TaskDispatcher(EventBus())
+    recon_result = dispatcher.dispatch("recon", payload)
+    report_json = _recon_to_report_json(recon_result if isinstance(recon_result, dict) else {})
+    report_markdown = _recon_to_report_markdown(recon_result if isinstance(recon_result, dict) else {})
     return {
         "reply": _brief_report(report_json),
         "report_json": report_json,
@@ -2007,6 +2075,15 @@ def _run_audit(budget_source: Any, actual_source: Any) -> Dict[str, Any]:
 def _format_task_reply(task_type: str, result: Dict[str, Any]) -> str:
     normalized_task = str(task_type or "").strip().lower()
     result_type = str(result.get("type", "")).strip().lower()
+    result_status = str(result.get("status", "")).strip().lower()
+
+    if result_type == "confirmation":
+        message = str(result.get("message", "")).strip()
+        return message or "检测到高风险写操作，请先确认后再执行。"
+
+    if result_type == "clarification":
+        message = str(result.get("message", "")).strip()
+        return message or "当前请求信息不足，请补充目标与输入范围后重试。"
 
     if normalized_task == "recon" or result_type == "recon":
         summary = result.get("summary", {}) if isinstance(result.get("summary", {}), dict) else {}
@@ -2101,6 +2178,10 @@ def _format_task_reply(task_type: str, result: Dict[str, Any]) -> str:
 
     if normalized_task == "file_edit" or result_type == "file_edit":
         status = str(result.get("status", "unknown"))
+        if result_status in {"needs_clarification", "pending_confirmation"}:
+            message = str(result.get("message", "")).strip()
+            if message:
+                return message
         changeset = result.get("changeset", [])
         change_count = len(changeset) if isinstance(changeset, list) else 0
         return f"文件编辑任务完成：状态={status}，变更 {change_count} 项。"

@@ -237,6 +237,28 @@ def file_edit_gateway_node(state: AppState) -> AppState:
         }
 
     safe_actions = [item for item in actions if isinstance(item, dict)] if isinstance(actions, list) else []
+    if not safe_actions:
+        message = "未检测到可执行文件操作，请补充目标文件路径与具体修改内容后重试。"
+        result = {
+            "type": "file_edit",
+            "status": "needs_clarification",
+            "operation_id": operation_id,
+            "workspace_root": str(root),
+            "message": message,
+            "warnings": warnings,
+            "errors": errors,
+            "changeset": [],
+        }
+        return {
+            "file_tool_result": result,
+            "result": result,
+            "errors": errors,
+            "task_progress": state.get("task_progress", [])
+            + [
+                {"step": "file_edit_clarify", "tool_name": "FileToolGateway"},
+            ],
+        }
+
     high_risk = any(str(item.get("action", "")).strip() in HIGH_RISK_ACTIONS for item in safe_actions)
     if high_risk and requires_confirmation and not user_confirmed:
         warnings.append("检测到高风险写操作，需先确认 policy.confirmed=true 后再执行。")
