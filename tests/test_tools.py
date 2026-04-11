@@ -89,7 +89,7 @@ from agent.tools.extraction_tools import (
     parse_activity,
 )
 from agent.tools.input_tools import classify_files, scan_inputs
-from agent.tools.qa_tools import answer_generate, build_workflow_hint, question_understand
+from agent.tools.qa_tools import _generate_llm_answer, answer_generate, build_workflow_hint, question_understand
 from agent.tools.rule_tools import check_rules, rag_retrieve, rule_retrieve
 from agent.tools.stats_tools import (
     aggregate_records,
@@ -291,6 +291,7 @@ class TestRuleQATools(unittest.TestCase):
         )
         self.assertTrue(ans_res.success)
         self.assertIn("海外实践", ans_res.data["answer"])
+        self.assertNotIn("主要依据：", ans_res.data["answer"])
         self.assertEqual(ans_res.data["citations"][0]["category"], "海外实践")
 
     def test_answer_generate_returns_direct_answer_with_citation_labels(self) -> None:
@@ -312,7 +313,7 @@ class TestRuleQATools(unittest.TestCase):
         self.assertTrue(ans_res.success)
         self.assertIn("交通费用", ans_res.data["answer"])
         self.assertIn("住宿费", ans_res.data["answer"])
-        self.assertIn("参考：书院财务报销规范-苗霖霖-202508.pptx", ans_res.data["answer"])
+        self.assertNotIn("参考：", ans_res.data["answer"])
         self.assertNotIn("请参考", ans_res.data["answer"])
 
     def test_answer_generate_prefers_llm_synthesis_when_available(self) -> None:
@@ -334,7 +335,7 @@ class TestRuleQATools(unittest.TestCase):
             )
         self.assertTrue(ans_res.success)
         self.assertIn("可报销范围包括交通与住宿", ans_res.data["answer"])
-        self.assertIn("主要依据：书院财务报销规范-片段7", ans_res.data["answer"])
+        self.assertNotIn("主要依据：", ans_res.data["answer"])
         self.assertNotIn("根据检索到的制度内容，整理如下", ans_res.data["answer"])
 
     def test_answer_generate_fallback_when_llm_unavailable(self) -> None:
@@ -355,8 +356,31 @@ class TestRuleQATools(unittest.TestCase):
                 intent="policy",
             )
         self.assertTrue(ans_res.success)
-        self.assertIn("根据检索到的制度内容，整理如下", ans_res.data["answer"])
+        self.assertIn("结论与建议：", ans_res.data["answer"])
         self.assertIn("交通费用", ans_res.data["answer"])
+
+    def test_generate_llm_answer_keeps_markdown_line_breaks(self) -> None:
+        ranked = [
+            {
+                "title": "书院财务报销规范-片段7",
+                "source": "书院财务报销规范-苗霖霖-202508.pptx",
+                "content": "先报备，再整理决算表和票据。",
+                "score": 0.91,
+            }
+        ]
+        llm_raw = "结论：可报销\n\n- 先报备\n- 再提交材料\n主要依据：片段7"
+        with patch("agent.tools.qa_tools._call_llm_chat", return_value=llm_raw):
+            with patch.dict(
+                "os.environ",
+                {"AGENT_QA_USE_LLM_ANSWER": "true", "AGENT_LLM_API_KEY": "sk-test", "AGENT_LLM_MODEL": "test-model"},
+                clear=False,
+            ):
+                answer = _generate_llm_answer("报销流程", ranked, intent="policy")
+        self.assertIsNotNone(answer)
+        text = str(answer)
+        self.assertIn("\n- 先报备", text)
+        self.assertIn("\n- 再提交材料", text)
+        self.assertNotIn("主要依据：", text)
 
     def test_build_workflow_hint(self) -> None:
         finance_hint = build_workflow_hint("帮我处理财务报销并自动填表")
@@ -416,6 +440,15 @@ class TestDocStorageStatsTools(unittest.TestCase):
             save_res = save_record(record, db_path=db_path)
             self.assertTrue(save_res.success)
 
+            # Ensure outputs generated in the same second still have distinct filenames.
+            final_res1 = generate_final_account({"by_month": [], "total_amount": 0.0}, output_dir=tmp)
+            final_res2 = generate_final_account({"by_month": [], "total_amount": 0.0}, output_dir=tmp)
+            self.assertNotEqual(final_res1.data["final_account_path"], final_res2.data["final_account_path"])
+
+            budget_res1 = generate_budget({"growth_rate": 0}, output_dir=tmp)
+            budget_res2 = generate_budget({"growth_rate": 0}, output_dir=tmp)
+            self.assertNotEqual(budget_res1.data["budget_path"], budget_res2.data["budget_path"])
+
             load_res = load_records({}, db_path=db_path)
             self.assertTrue(load_res.success)
             self.assertGreaterEqual(len(load_res.data["records"]), 1)
@@ -466,7 +499,7 @@ class TestReimburseRouting(unittest.TestCase):
             "payload": {"stop_on_rule_violation": False},
             "rule_result": {"compliance": False},
         }
-        self.assertEqual(route_after_rule_check(state_ok), "GenDocNode")
+        self.assertEqual(route_after_rule_check(state_ok), "CollectInfoNode")
         policy_state = {
             "payload": {"graph_policy": {"reimburse_stop_on_rule_violation": True}},
             "rule_result": {"compliance": False},

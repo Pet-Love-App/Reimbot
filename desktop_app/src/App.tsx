@@ -983,27 +983,8 @@ export default function App() {
     }
 
     if (task === "qa") {
-      const answer = String(taskResult.answer ?? "");
-      const citations = Array.isArray(taskResult.citations) ? taskResult.citations.length : 0;
-      const retrieval = String(taskResult.retrieval ?? "");
-      const confidenceRaw = Number(taskResult.confidence ?? 0);
-      const confidence = Number.isFinite(confidenceRaw) ? confidenceRaw : 0;
-      const needsClarification = Boolean(taskResult.needs_clarification);
-      const clarifyingQuestion = String(taskResult.clarifying_question ?? "");
-      const itemsCountRaw = Number(taskResult.items_count ?? 0);
-      const itemsCount = Number.isFinite(itemsCountRaw) ? itemsCountRaw : 0;
-
-      let lines =
-        `\n\n### 任务结果\n- 任务类型: ${TASK_META[task].label}` +
-        `\n- 引用条目: ${citations}` +
-        `\n- 检索模式: ${retrieval || "unknown"}` +
-        `\n- 候选条目: ${itemsCount}` +
-        `\n- 置信度: ${confidence.toFixed(2)}` +
-        `\n- 需要补充信息: ${needsClarification ? "是" : "否"}`;
-      if (needsClarification && clarifyingQuestion) {
-        lines += `\n- 澄清问题: ${clarifyingQuestion}`;
-      }
-      return `${lines}\n\n${answer}`;
+      // Chat replies should stay conversational; do not append QA evaluation/debug fields.
+      return "";
     }
 
     if (task === "reimburse") {

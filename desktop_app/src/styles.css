@@ -1498,6 +1498,7 @@ body[data-theme="dark"] .compare-status-warning {
   gap: 12px;
   align-items: stretch;
   grid-auto-rows: minmax(260px, 1fr);
+  overflow-y: auto;
 }
 
 .compare-pane-card {

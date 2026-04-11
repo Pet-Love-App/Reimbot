@@ -115,7 +115,8 @@ function buildDocBlocks(preview: TemplatePreview | null): string[] {
 
 function collectPreviewLines(preview: TemplatePreview | null): string[] {
   if (!preview) return [];
-  if (preview.fileType === "xlsx" || preview.fileType === "xls") {
+  const fileType = preview.fileType.toLowerCase();
+  if (fileType === "xlsx" || fileType === "xls" || fileType === "csv") {
     const lines: string[] = [];
     for (const sheet of preview.sheets) {
       for (const row of sheet.rows) {
@@ -475,7 +476,10 @@ function buildProcessChecks(
 
 function buildWorkbookDiff(finalPreview: TemplatePreview | null, budgetPreview: TemplatePreview | null): SheetDiffResult[] {
   if (!finalPreview || !budgetPreview) return [];
-  if (!["xlsx", "xls"].includes(finalPreview.fileType) || !["xlsx", "xls"].includes(budgetPreview.fileType)) {
+  const excelTypes = ["xlsx", "xls", "csv"];
+  const finalType = finalPreview.fileType.toLowerCase();
+  const budgetType = budgetPreview.fileType.toLowerCase();
+  if (!excelTypes.includes(finalType) || !excelTypes.includes(budgetType)) {
     return [];
   }
 
@@ -540,13 +544,15 @@ function buildDocumentDiff(finalPreview: TemplatePreview | null, budgetPreview: 
 
 function detectCompareMode(finalPreview: TemplatePreview | null, budgetPreview: TemplatePreview | null): CompareMode {
   if (!finalPreview || !budgetPreview) return "none";
-  const excelTypes = new Set(["xlsx", "xls"]);
+  const excelTypes = new Set(["xlsx", "xls", "csv"]);
   const docTypes = new Set(["doc", "docx"]);
+  const finalType = finalPreview.fileType.toLowerCase();
+  const budgetType = budgetPreview.fileType.toLowerCase();
 
-  if (excelTypes.has(finalPreview.fileType) && excelTypes.has(budgetPreview.fileType)) {
+  if (excelTypes.has(finalType) && excelTypes.has(budgetType)) {
     return "excel";
   }
-  if (docTypes.has(finalPreview.fileType) && docTypes.has(budgetPreview.fileType)) {
+  if (docTypes.has(finalType) && docTypes.has(budgetType)) {
     return "doc";
   }
   return "unsupported";
@@ -572,11 +578,14 @@ function renderSheetTable(
     return <div className="compare-empty">请选择文件并开始核对</div>;
   }
 
-  if (!["xlsx", "xls"].includes(preview.fileType)) {
+  if (!["xlsx", "xls", "csv"].includes(preview.fileType.toLowerCase())) {
     return <div className="compare-empty">当前文件不是 Excel，暂不支持单元格高亮。</div>;
   }
 
-  const rows = findSheet(preview, sheetDiff?.name ?? preview.sheets[0]?.name ?? "");
+  const defaultSheetName = preview.sheets[0]?.name || "";
+  const actualSheetName =
+    sheetDiff?.name && preview.sheets.some((sheet) => sheet.name === sheetDiff.name) ? sheetDiff.name : defaultSheetName;
+  const rows = findSheet(preview, actualSheetName);
   const maxRows = sheetDiff?.maxRows ?? rows.length;
   const maxCols = sheetDiff?.maxCols ?? rows.reduce((max, row) => Math.max(max, row.length), 0);
   const mismatches = sheetDiff?.mismatchKeys ?? new Set<string>();

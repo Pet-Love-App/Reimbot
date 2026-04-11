@@ -167,6 +167,36 @@ class TestSupervisorRouter(unittest.TestCase):
         self.assertFalse(bool(route_decision.get("clarification_required", True)))
         self.assertEqual(route_by_task(updated), "QAStartNode")
 
+    def test_intent_node_expense_classification_question_routes_to_qa(self) -> None:
+        state = {
+            "payload": {"query": "订酒店的费用属于哪类费用？"},
+            "task_progress": [],
+        }
+        updated = intent_node(state)
+        self.assertEqual(updated.get("task_type"), "qa")
+        route_decision = updated.get("route_decision", {})
+        self.assertEqual(route_decision.get("task_type"), "qa")
+        self.assertIn("R103_QA_EXPENSE_CLASSIFY", route_decision.get("reason_codes", []))
+        self.assertFalse(bool(route_decision.get("clarification_required", True)))
+        self.assertEqual(route_by_task(updated), "QAStartNode")
+
+    def test_intent_node_uses_llm_fallback_for_low_confidence_query(self) -> None:
+        with patch(
+            "agent.graphs.intent._infer_task_with_llm_fallback",
+            return_value=("qa", 0.91, "费用归类问题应走问答"),
+        ):
+            state = {
+                "payload": {"query": "住宿费走哪类"},
+                "task_progress": [],
+            }
+            updated = intent_node(state)
+        self.assertEqual(updated.get("task_type"), "qa")
+        route_decision = updated.get("route_decision", {})
+        self.assertEqual(route_decision.get("task_type"), "qa")
+        self.assertFalse(bool(route_decision.get("clarification_required", True)))
+        self.assertIn("R901_LLM_FALLBACK", route_decision.get("reason_codes", []))
+        self.assertEqual(route_by_task(updated), "QAStartNode")
+
     def test_route_by_task_file_edit(self) -> None:
         self.assertEqual(route_by_task({"task_type": "file_edit"}), "FileEditStartNode")
 
