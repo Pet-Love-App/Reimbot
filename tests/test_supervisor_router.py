@@ -11,7 +11,7 @@ from agent.graphs.main_graph import _validate_route_spec_contract, _with_node_tr
 from agent.graphs.names import ALL_GRAPH_NODES, INTENT_ROUTE_TARGETS
 from agent.graphs.intent import intent_node, route_by_task
 from agent.graphs.spec import build_conditional_route_snapshot
-from agent.graphs.subgraphs.budget import route_after_load_final_data
+from agent.graphs.subgraphs.budget import budget_generate_node, route_after_load_final_data
 from agent.graphs.subgraphs.final_account import final_generate_node
 from agent.graphs.subgraphs.file_edit import file_edit_gateway_node
 from agent.graphs.subgraphs.final_account import route_after_data_clean, route_after_load_records
@@ -203,6 +203,8 @@ class TestSupervisorRouter(unittest.TestCase):
     def test_task_registry_alias_and_runtime_start_mapping(self) -> None:
         self.assertEqual(normalize_task_alias("t4_budget_fill"), "budget_fill")
         self.assertEqual(normalize_task_alias("T6_FILE_EDIT"), "file_edit")
+        self.assertEqual(normalize_task_alias("单次报销"), "reimburse")
+        self.assertEqual(normalize_task_alias("单次报销处理"), "reimburse")
         self.assertEqual(get_start_node_for_runtime_task("budget"), "BudgetStartNode")
         self.assertEqual(get_start_node_for_runtime_task("final_account"), "FinalStartNode")
         self.assertEqual(get_start_node_for_runtime_task("recon"), "ReconStartNode")
@@ -349,6 +351,21 @@ class TestSupervisorRouter(unittest.TestCase):
             self.assertEqual(result.get("type"), "file_edit")
             self.assertEqual(result.get("status"), "needs_clarification")
             self.assertIn("补充目标文件路径", str(result.get("message", "")))
+
+    def test_budget_generate_guard_for_budget_fill_without_data(self) -> None:
+        state = {
+            "aggregate": {},
+            "budget": {},
+            "route_decision": {"task_type": "budget_fill"},
+            "payload": {},
+            "errors": [],
+            "task_progress": [],
+        }
+        updated = budget_generate_node(state)
+        result = updated.get("result", {})
+        self.assertEqual(result.get("type"), "budget")
+        self.assertEqual(result.get("status"), "needs_clarification")
+        self.assertIn("未检测到可用于预算填表的数据", str(result.get("message", "")))
 
     def test_fail_fast_routes(self) -> None:
         self.assertEqual(route_after_scan({"errors": ["scan failed"], "files": []}), "ReimburseFailNode")

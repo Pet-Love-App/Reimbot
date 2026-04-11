@@ -8,6 +8,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 import zipfile
+from pathlib import PurePath
 
 
 def _load_bridge_module():
@@ -245,6 +246,17 @@ class TestAgentBridgeTaskMode(unittest.TestCase):
         self.assertFalse(any("项目B" in fact for fact in facts_a))
         self.assertTrue(any("项目B" in fact for fact in facts_b))
 
+    def test_prepare_task_payload_sets_reimburse_output_dir_from_workspace(self) -> None:
+        payload = self.bridge._prepare_task_payload_for_dispatch(
+            "执行任务",
+            {"workspace_dir": "C:/demo/workspace"},
+            {"activity_text": "测试活动"},
+            "reimburse",
+        )
+        self.assertEqual(str(payload.get("workspace_dir", "")), "C:/demo/workspace")
+        expected = PurePath("C:/demo/workspace") / "docs" / "parsed" / "reimburse_outputs"
+        self.assertEqual(str(payload.get("output_dir", "")), str(expected))
+
     def test_extract_workspace_plan_with_invalid_json_windows_path(self) -> None:
         planner_raw = (
             '{ "reply": "请提供具体文件路径和修改内容，例如：'
@@ -411,6 +423,26 @@ class TestAgentBridgeTaskMode(unittest.TestCase):
         }
         reply = self.bridge._format_task_reply("auto", result)
         self.assertEqual(reply, "检测到高风险写操作，请先确认。")
+
+    def test_format_task_reply_for_budget_in_auto_mode(self) -> None:
+        result = {
+            "type": "budget",
+            "budget_path": "E:/tmp/budget.xlsx",
+            "report_path": "E:/tmp/report.md",
+        }
+        reply = self.bridge._format_task_reply("auto", result)
+        self.assertIn("预算任务已完成", reply)
+        self.assertIn("budget.xlsx", reply)
+        self.assertIn("report.md", reply)
+
+    def test_format_task_reply_for_budget_needs_clarification(self) -> None:
+        result = {
+            "type": "budget",
+            "status": "needs_clarification",
+            "message": "未检测到可用于预算填表的数据，请补充后重试。",
+        }
+        reply = self.bridge._format_task_reply("auto", result)
+        self.assertEqual(reply, "未检测到可用于预算填表的数据，请补充后重试。")
 
     def test_format_task_reply_for_file_edit_needs_clarification(self) -> None:
         result = {

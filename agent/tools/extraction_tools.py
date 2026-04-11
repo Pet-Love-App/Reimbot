@@ -48,13 +48,18 @@ def ocr_extract(file_path: str) -> ToolResult:
             
             # 批量 OCR
             results = run_ocr_batch(images)
-            text = "\n\n".join(results)
+            valid_results = [
+                str(item).strip()
+                for item in results
+                if str(item).strip() and not str(item).strip().startswith("[OCR ERROR")
+            ]
+            text = "\n\n".join(valid_results)
         else:
             # 非 PDF 文件：直接 OCR
             from agent.parser.utils.ocr_utils import run_ocr_on_file
             text = str(run_ocr_on_file(file_path)).strip()
         
-        if not text:
+        if not text or text.startswith("[OCR ERROR"):
             return fail("OCR 未识别到有效文本", fallback_used=True, text="")
         return ok(text=text)
     except Exception as exc:
@@ -338,33 +343,67 @@ def parse_activity(activity_text: str) -> ToolResult:
     return ok(activity=info)
 
 
-def extract_text_from_files(classified: Dict[str, List[str]]) -> ToolResult:
+def extract_text_from_files(
+    classified: Dict[str, List[str]],
+    *,
+    prefer_ocr_for_pdf: bool = False,
+) -> ToolResult:
     texts: List[str] = []
     file_text_map: Dict[str, str] = {}
+    ocr_summary: Dict[str, int | bool] = {
+        "prefer_ocr_for_pdf": bool(prefer_ocr_for_pdf),
+        "pdf_total": 0,
+        "pdf_ocr_attempted": 0,
+        "pdf_ocr_success": 0,
+        "pdf_text_layer_used": 0,
+        "image_total": 0,
+        "image_ocr_attempted": 0,
+        "image_ocr_success": 0,
+    }
 
     for pdf in classified.get("pdf", []):
+        ocr_summary["pdf_total"] = int(ocr_summary["pdf_total"]) + 1
+        if prefer_ocr_for_pdf:
+            ocr_summary["pdf_ocr_attempted"] = int(ocr_summary["pdf_ocr_attempted"]) + 1
+            ocr_res = ocr_extract(pdf)
+            ocr_text = str(ocr_res.data.get("text", "")).strip()
+            if ocr_text:
+                ocr_summary["pdf_ocr_success"] = int(ocr_summary["pdf_ocr_success"]) + 1
+                file_text_map[pdf] = ocr_text
+                texts.append(ocr_text)
+                continue
+
         pdf_res = extract_pdf_text(pdf)
-        if pdf_res.success and pdf_res.data.get("text"):
-            text = str(pdf_res.data["text"])
-            file_text_map[pdf] = text
-            texts.append(text)
+        pdf_text = str(pdf_res.data.get("text", "")).strip()
+        if pdf_res.success and pdf_text:
+            ocr_summary["pdf_text_layer_used"] = int(ocr_summary["pdf_text_layer_used"]) + 1
+            file_text_map[pdf] = pdf_text
+            texts.append(pdf_text)
             continue
-        # PDF 没有文本层，尝试 OCR
+
+        ocr_summary["pdf_ocr_attempted"] = int(ocr_summary["pdf_ocr_attempted"]) + 1
         ocr_res = ocr_extract(pdf)
-        text = str(ocr_res.data.get("text", ""))
-        if text:
-            file_text_map[pdf] = text
-            texts.append(text)
+        ocr_text = str(ocr_res.data.get("text", "")).strip()
+        if ocr_text:
+            ocr_summary["pdf_ocr_success"] = int(ocr_summary["pdf_ocr_success"]) + 1
+            file_text_map[pdf] = ocr_text
+            texts.append(ocr_text)
         else:
-            file_text_map[pdf] = "[PDF 无文本层且 OCR 失败]"
-            texts.append("[PDF 无文本层且 OCR 失败]")
+            file_text_map[pdf] = "[PDF OCR 失败]"
+            texts.append("[PDF OCR 失败]")
 
     for img in classified.get("image", []):
+        ocr_summary["image_total"] = int(ocr_summary["image_total"]) + 1
+        ocr_summary["image_ocr_attempted"] = int(ocr_summary["image_ocr_attempted"]) + 1
         ocr_res = ocr_extract(img)
-        text = str(ocr_res.data.get("text", ""))
+        text = str(ocr_res.data.get("text", "")).strip()
         if text:
+            ocr_summary["image_ocr_success"] = int(ocr_summary["image_ocr_success"]) + 1
             file_text_map[img] = text
             texts.append(text)
+        else:
+            file_text_map[img] = "[图片 OCR 失败]"
+            texts.append("[图片 OCR 失败]")
 
     for txt in classified.get("text", []):
         try:
@@ -374,4 +413,4 @@ def extract_text_from_files(classified: Dict[str, List[str]]) -> ToolResult:
         file_text_map[txt] = content
         texts.append(content)
 
-    return ok(file_text_map=file_text_map, merged_text="\n\n".join(texts))
+    return ok(file_text_map=file_text_map, merged_text="\n\n".join(texts), ocr_summary=ocr_summary)

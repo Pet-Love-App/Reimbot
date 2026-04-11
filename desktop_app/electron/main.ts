@@ -46,6 +46,11 @@ let petDragState: { startMouseX: number; startMouseY: number; startWindowX: numb
 const isDev = !app.isPackaged;
 const rendererDevServer = "http://localhost:5173";
 const LLM_CONFIG_FILE_NAME = "llm_config.json";
+const WORKSPACE_CONFIG_FILE_NAME = "workspace_config.json";
+
+type WorkspaceConfig = {
+  workspaceDir: string;
+};
 
 type LlmProvider = "openai" | "glm" | "deepseek" | "qwen" | "anthropic" | "custom";
 type LlmConfig = {
@@ -141,6 +146,35 @@ function sanitizeLlmConfig(input: Partial<LlmConfig> | null | undefined): LlmCon
 
 function llmConfigFilePath(): string {
   return path.join(app.getPath("userData"), LLM_CONFIG_FILE_NAME);
+}
+
+function workspaceConfigFilePath(): string {
+  return path.join(app.getPath("userData"), WORKSPACE_CONFIG_FILE_NAME);
+}
+
+function saveWorkspaceDirToDisk(dir: string): void {
+  try {
+    const filePath = workspaceConfigFilePath();
+    fs.mkdirSync(path.dirname(filePath), { recursive: true });
+    const payload: WorkspaceConfig = { workspaceDir: dir };
+    fs.writeFileSync(filePath, JSON.stringify(payload, null, 2), "utf-8");
+  } catch {
+    // ignore persistence failure and keep in-memory fallback
+  }
+}
+
+function loadWorkspaceDirFromDisk(): string | null {
+  try {
+    const filePath = workspaceConfigFilePath();
+    if (!fs.existsSync(filePath)) {
+      return null;
+    }
+    const raw = fs.readFileSync(filePath, "utf-8");
+    const parsed = JSON.parse(raw) as Partial<WorkspaceConfig>;
+    return normalizeWorkspaceDir(String(parsed.workspaceDir ?? ""));
+  } catch {
+    return null;
+  }
 }
 
 function loadLlmConfigFromDisk(): LlmConfig {
@@ -571,8 +605,10 @@ function createPetChatWindow(): void {
   }
 
   petChatWindow = new BrowserWindow({
-    width: 420,
-    height: 520,
+    width: 760,
+    height: 700,
+    minWidth: 520,
+    minHeight: 640,
     show: true,
     frame: false,
     resizable: true,
@@ -609,8 +645,53 @@ function emitWorkspaceUpdated(): void {
 function setBoundWorkspaceDir(dir: string): string {
   const normalized = path.resolve(dir);
   petWorkspaceDir = normalized;
+  saveWorkspaceDirToDisk(normalized);
   emitWorkspaceUpdated();
   return normalized;
+}
+
+function toPayloadRecord(input: unknown): Record<string, unknown> {
+  if (!input || typeof input !== "object" || Array.isArray(input)) {
+    return {};
+  }
+  return { ...(input as Record<string, unknown>) };
+}
+
+function attachWorkspaceToPayload(
+  input: unknown,
+  options?: { forceBoundWorkspace?: boolean }
+): Record<string, unknown> {
+  const payload = toPayloadRecord(input);
+  const boundDir = ensurePetWorkspaceDir();
+  if (!boundDir) {
+    return payload;
+  }
+  const forceBoundWorkspace = Boolean(options?.forceBoundWorkspace);
+
+  const workspaceDirRaw = String(payload.workspace_dir ?? "").trim();
+  if (forceBoundWorkspace || !workspaceDirRaw) {
+    payload.workspace_dir = boundDir;
+  }
+
+  const workspaceRootRaw = String(payload.workspace_root ?? "").trim();
+  if (forceBoundWorkspace || !workspaceRootRaw) {
+    payload.workspace_root = String(payload.workspace_dir ?? boundDir);
+  }
+
+  const taskPayload = toPayloadRecord(payload.task_payload);
+  if (Object.keys(taskPayload).length > 0 || payload.task_payload !== undefined) {
+    const nestedWorkspaceDir = String(taskPayload.workspace_dir ?? "").trim();
+    if (forceBoundWorkspace || !nestedWorkspaceDir) {
+      taskPayload.workspace_dir = String(payload.workspace_dir ?? boundDir);
+    }
+    const nestedWorkspaceRoot = String(taskPayload.workspace_root ?? "").trim();
+    if (forceBoundWorkspace || !nestedWorkspaceRoot) {
+      taskPayload.workspace_root = String(taskPayload.workspace_dir ?? payload.workspace_root ?? boundDir);
+    }
+    payload.task_payload = taskPayload;
+  }
+
+  return payload;
 }
 
 function emitChatHistoryUpdate(): void {
@@ -976,11 +1057,17 @@ function ensurePetWorkspaceDir(): string | null {
       petWorkspaceDir = null;
     }
   }
+  const persisted = loadWorkspaceDirFromDisk();
+  if (persisted) {
+    petWorkspaceDir = persisted;
+    return petWorkspaceDir;
+  }
   const fallback = resolveDefaultBoundDir();
   if (!fallback) {
     return null;
   }
   petWorkspaceDir = path.resolve(fallback);
+  saveWorkspaceDirToDisk(petWorkspaceDir);
   return petWorkspaceDir;
 }
 
@@ -1859,25 +1946,52 @@ ipcMain.handle("trace:export", async (_event, query?: string | EditTraceQuery) =
 });
 
 ipcMain.handle("agent:chat", async (_event, request: { message: string; payload?: unknown }) => {
-  return invokePythonChat(request);
+  const rawPayload = toPayloadRecord(request.payload);
+  const hasTaskRoute =
+    String(rawPayload.task_type ?? "").trim().length > 0 ||
+    String(rawPayload.route_mode ?? "").trim().toLowerCase() === "task";
+  return invokePythonChat({
+    message: request.message,
+    payload: attachWorkspaceToPayload(request.payload, {
+      forceBoundWorkspace: hasTaskRoute,
+    }),
+  });
 });
 
 ipcMain.handle(
   "agent:task",
   async (_event, request: { taskType: string; taskPayload?: unknown }) => {
+    const taskType = String(request.taskType ?? "").trim();
+    const taskPayload = attachWorkspaceToPayload(request.taskPayload, { forceBoundWorkspace: true });
+    if (taskType.toLowerCase() === "qa" && taskPayload.workspace_mode === undefined) {
+      taskPayload.workspace_mode = true;
+    }
     return invokePythonChat({
       message: "执行任务",
-      payload: {
-        task_type: request.taskType,
-        task_payload: request.taskPayload,
-      },
+      payload: attachWorkspaceToPayload(
+        {
+        task_type: taskType,
+        task_payload: taskPayload,
+        workspace_mode: taskType.toLowerCase() === "qa" ? true : undefined,
+        },
+        { forceBoundWorkspace: true }
+      ),
     });
   }
 );
 
 ipcMain.handle("agent:chat:start", async (_event, request: { message: string; payload?: unknown }) => {
   const chatId = randomUUID();
-  invokePythonChatStream(chatId, request);
+  const rawPayload = toPayloadRecord(request.payload);
+  const hasTaskRoute =
+    String(rawPayload.task_type ?? "").trim().length > 0 ||
+    String(rawPayload.route_mode ?? "").trim().toLowerCase() === "task";
+  invokePythonChatStream(chatId, {
+    message: request.message,
+    payload: attachWorkspaceToPayload(request.payload, {
+      forceBoundWorkspace: hasTaskRoute,
+    }),
+  });
   return { chatId };
 });
 
@@ -1885,12 +1999,21 @@ ipcMain.handle(
   "agent:task:start",
   async (_event, request: { taskType: string; taskPayload?: unknown }) => {
     const chatId = randomUUID();
+    const taskType = String(request.taskType ?? "").trim();
+    const taskPayload = attachWorkspaceToPayload(request.taskPayload, { forceBoundWorkspace: true });
+    if (taskType.toLowerCase() === "qa" && taskPayload.workspace_mode === undefined) {
+      taskPayload.workspace_mode = true;
+    }
     invokePythonChatStream(chatId, {
       message: "执行任务",
-      payload: {
-        task_type: request.taskType,
-        task_payload: request.taskPayload,
-      },
+      payload: attachWorkspaceToPayload(
+        {
+        task_type: taskType,
+        task_payload: taskPayload,
+        workspace_mode: taskType.toLowerCase() === "qa" ? true : undefined,
+        },
+        { forceBoundWorkspace: true }
+      ),
     });
     return { chatId };
   }

@@ -4,7 +4,7 @@ export type AgentChatResponse = {
   report_json?: Record<string, unknown>;
   report_markdown?: string;
   mode?: "llm" | "task" | "workspace";
-  task_type?: "qa" | "reimburse" | "final_account" | "budget";
+  task_type?: "qa" | "reimburse" | "final_account" | "budget" | "budget_fill" | "final_fill";
   task_result?: Record<string, unknown>;
   task_progress?: Array<Record<string, unknown>>;
   error?: string;

@@ -7,7 +7,27 @@ type Props = {
   content: string;
 };
 
+function normalizeReadableMarkdown(raw: string): string {
+  const text = String(raw ?? "").replace(/\r\n/g, "\n").trim();
+  if (!text) return "";
+  // Keep code blocks untouched to avoid breaking fenced markdown.
+  if (text.includes("```")) return text;
+
+  // Only apply heuristics to one-line outputs, which are the primary readability issue.
+  if (!text.includes("\n")) {
+    return text
+      .replace(/([:：])\s*(\d+\.\s*)/g, "$1\n$2")
+      .replace(/([；;。！？])\s*(\d+\.\s*)/g, "$1\n$2")
+      .replace(/\s+(必要条件包括[:：])/g, "\n$1")
+      .trim();
+  }
+
+  return text;
+}
+
 export function MarkdownRenderer({ content }: Props) {
+  const normalizedContent = normalizeReadableMarkdown(content);
+
   return (
     <ReactMarkdown
       remarkPlugins={[remarkGfm]}
@@ -55,7 +75,7 @@ export function MarkdownRenderer({ content }: Props) {
         },
       }}
     >
-      {content}
+      {normalizedContent}
     </ReactMarkdown>
   );
 }

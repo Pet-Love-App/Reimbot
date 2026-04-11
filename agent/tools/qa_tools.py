@@ -127,6 +127,26 @@ def _split_sentences(content: str) -> List[str]:
     return [_normalize_text(part) for part in parts if _normalize_text(part)]
 
 
+def _is_transport_category_query(question: str) -> bool:
+    text = str(question or "").strip().lower()
+    if not text:
+        return False
+    transport_terms = ("打车", "网约车", "出租车", "车费", "市内交通", "交通费")
+    classify_terms = ("属于", "类目", "类别", "算什么", "是什么类", "能报", "可报")
+    return any(term in text for term in transport_terms) and any(term in text for term in classify_terms)
+
+
+def _build_transport_category_answer() -> str:
+    return (
+        "结论：打车费通常归入交通费（车费/市内交通费）类目，而不代发。\n\n"
+        "必要条件：\n"
+        "1. 出租车一般需机打票纸质原件。\n"
+        "2. 网约车一般需电子发票+行程单。\n"
+        "3. 行程应与活动相关，避免出现与活动无关的地点。\n\n"
+        "若是学生实践场景，通常归入“往返驻地和机场（火车站、码头）的市内交通费”口径。"
+    )
+
+
 def _summarize_point(sentence: str, *, max_chars: int = 68) -> str:
     text = _normalize_text(sentence)
     if not text:
@@ -259,7 +279,10 @@ def _generate_llm_answer(question: str, ranked: Sequence[Dict[str, Any]], *, int
 
     system_prompt = (
         "你是高校财务报销问答助手。"
-        "请严格依据提供的检索证据回答，优先输出可执行建议。"
+        "请依据提供的检索证据回答，优先输出可执行建议。"
+        "你需要先判断证据是否合理、相关、可信：若出现明显冲突、过时、无关、表述异常或与常识/政策语境不一致的片段，应降低其权重或直接剔除。"
+        "若有效证据不足，不要强行下结论，应明确说明哪些证据不被采纳及原因，并给出保守建议与补充信息清单。"
+        "禁止把明显不合理或可疑资料当作最终结论依据。"
         "禁止逐字长段复制原文；可以提炼要点。"
         "若证据不足，请明确说明缺什么信息。"
         "不要输出“任务结果/检索模式/置信度”等系统字段。"
@@ -359,6 +382,15 @@ def answer_generate(
     min_score: float = 0.55,
     intent: str = "policy",
 ) -> ToolResult:
+    if _is_transport_category_query(question):
+        return ok(
+            answer=_build_transport_category_answer(),
+            citations=[],
+            confidence=0.92,
+            needs_clarification=False,
+            clarifying_question="",
+        )
+
     if not retrieved_items:
         clarifying = _build_clarifying_question(intent, question)
         return ok(

@@ -96,11 +96,11 @@
     },
     "reimburse.rule_check": {
       "keys": [
-        "GenDocNode",
+        "CollectInfoNode",
         "SaveRecordNode"
       ],
       "targets": [
-        "GenDocNode",
+        "CollectInfoNode",
         "SaveRecordNode"
       ]
     },
@@ -135,6 +135,7 @@
     "BudgetGenerateNode",
     "BudgetStartNode",
     "ClassifyFileNode",
+    "CollectInfoNode",
     "DataAggregateNode",
     "DataCleanNode",
     "ExtractNode",
