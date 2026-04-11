@@ -200,6 +200,13 @@ def _classify_task(query: str, payload: Dict[str, Any]) -> Tuple[str, float, Lis
     has_check = any(key in text for key in ("核对", "比对", "差异", "勾稽", "一致性"))
     has_fill = any(key in text for key in ("填写", "回填", "填报"))
 
+    has_invoice = any(key in text for key in ("发票", "电子发票", "票据"))
+    has_table_output = any(key in text for key in ("excel", "xlsx", "表格", "汇总表", "明细表"))
+    has_extract_intent = any(key in text for key in ("提取", "识别", "ocr", "汇总", "整理", "生成"))
+    if has_invoice and has_table_output and has_extract_intent:
+        _append_reason(reasons, "R303_REIMBURSE_INVOICE_EXTRACT")
+        return TASK_REIMBURSE, 0.92, reasons
+
     if has_budget and has_final and has_check:
         _append_reason(reasons, "R201_RECON")
         return TASK_RECON, 0.9, reasons
@@ -221,7 +228,17 @@ def _classify_task(query: str, payload: Dict[str, Any]) -> Tuple[str, float, Lis
         return TASK_QA, 0.85, reasons
 
     expense_keywords = ("酒店", "住宿", "宾馆", "机票", "高铁", "打车", "餐饮", "费用")
-    classify_question_keywords = ("属于哪类", "算什么类", "是什么类", "能报吗", "可报吗", "是否可报")
+    classify_question_keywords = (
+        "属于哪类",
+        "属于什么类",
+        "属于什么类别",
+        "属于什么类目",
+        "算什么类",
+        "是什么类",
+        "能报吗",
+        "可报吗",
+        "是否可报",
+    )
     if any(key in text for key in expense_keywords) and any(key in text for key in classify_question_keywords):
         _append_reason(reasons, "R103_QA_EXPENSE_CLASSIFY")
         return TASK_QA, 0.86, reasons
@@ -242,8 +259,25 @@ def _classify_task(query: str, payload: Dict[str, Any]) -> Tuple[str, float, Lis
             "基本",
         )
     )
+    has_knowledge_question = any(
+        key in text
+        for key in (
+            "需要哪些",
+            "需要什么",
+            "要哪些",
+            "要什么",
+            "材料",
+            "附件要求",
+            "注意事项",
+            "条件",
+        )
+    )
     if has_reimburse and has_guide_question:
         _append_reason(reasons, "R102_QA_PROCESS")
+        return TASK_QA, 0.86, reasons
+
+    if has_reimburse and has_knowledge_question:
+        _append_reason(reasons, "R104_QA_KNOWLEDGE")
         return TASK_QA, 0.86, reasons
 
     if has_budget:
@@ -284,6 +318,26 @@ def _with_confirmation_policy(payload: Dict[str, Any], *, requires_confirmation:
     return {**payload, "policy": policy}
 
 
+def _inject_material_package_action(payload: Dict[str, Any]) -> Dict[str, Any]:
+    if not isinstance(payload, dict):
+        return payload
+    workspace_root = str(payload.get("workspace_root", "") or payload.get("workspace_dir", "")).strip()
+    if not workspace_root:
+        return payload
+    raw_actions = payload.get("actions", [])
+    actions = [item for item in raw_actions if isinstance(item, dict)] if isinstance(raw_actions, list) else []
+    if any(str(item.get("action", "")).strip() == "organize_reimbursement_package" for item in actions):
+        return payload
+    action: Dict[str, Any] = {"action": "organize_reimbursement_package"}
+    package_name = str(payload.get("package_name", "") or payload.get("reimbursement_package_name", "")).strip()
+    if package_name:
+        action["package_name"] = package_name
+    raw_options = payload.get("reimbursement_package_options", {})
+    if isinstance(raw_options, dict) and raw_options:
+        action["options"] = raw_options
+    return {**payload, "actions": [*actions, action]}
+
+
 def _is_confirmed(payload: Dict[str, Any]) -> bool:
     policy = payload.get("policy", {})
     if not isinstance(policy, dict):
@@ -295,6 +349,8 @@ def intent_node(state: AppState) -> AppState:
     payload: Dict[str, Any] = state.get("payload", {})
     explicit_task = _normalize_explicit_task(str(state.get("task_type", "")).strip().lower())
     if explicit_task:
+        if explicit_task == TASK_MATERIAL:
+            payload = _inject_material_package_action(payload)
         profile = get_task_profile(explicit_task) or TASK_PROFILES[TASK_REIMBURSE]
         runtime_task = profile["runtime_task"]
         risk_level = profile["risk_level"]
@@ -317,7 +373,8 @@ def intent_node(state: AppState) -> AppState:
 
     query = str(payload.get("query", ""))
     inferred_task, confidence, reason_codes = _classify_task(query, payload)
-    if confidence < 0.8:
+    # Always try LLM intent routing for implicit tasks to improve natural-language understanding.
+    if str(query or "").strip():
         llm_result = _infer_task_with_llm_fallback(
             query,
             rule_task=inferred_task,
@@ -325,13 +382,16 @@ def intent_node(state: AppState) -> AppState:
         )
         if llm_result is not None:
             llm_task, llm_conf, llm_reason = llm_result
-            if llm_conf >= 0.8:
+            # Keep deterministic high-confidence rule routing stable.
+            if llm_conf >= 0.6 and confidence < 0.85:
                 inferred_task = llm_task
                 confidence = llm_conf
                 _append_reason(reason_codes, "R901_LLM_FALLBACK")
                 if llm_reason:
                     _append_reason(reason_codes, "R901_LLM_REASON")
     profile = get_task_profile(inferred_task) or TASK_PROFILES[TASK_REIMBURSE]
+    if inferred_task == TASK_MATERIAL:
+        payload = _inject_material_package_action(payload)
     runtime_task = profile["runtime_task"]
     is_write_task = bool(profile.get("is_write_task", False))
     risk_level = "high" if is_write_task else "medium"
@@ -342,6 +402,10 @@ def intent_node(state: AppState) -> AppState:
     )
     requires_confirmation = is_write_task and confidence >= 0.8 and has_high_risk_actions
     next_payload = _with_confirmation_policy(payload, requires_confirmation=requires_confirmation)
+    clarification_required = confidence < 0.8
+    if runtime_task == TASK_QA and str(query or "").strip():
+        # For natural-language consultation queries, default to QA instead of forcing clarification.
+        clarification_required = False
 
     return {
         "task_type": runtime_task,
@@ -352,7 +416,7 @@ def intent_node(state: AppState) -> AppState:
             "risk_level": risk_level,
             "requires_confirmation": requires_confirmation,
             "reason_codes": reason_codes,
-            "clarification_required": confidence < 0.8,
+            "clarification_required": clarification_required,
         },
         "payload": {
             **next_payload,

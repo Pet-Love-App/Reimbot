@@ -46,25 +46,42 @@ def rule_retrieve_node(state: AppState) -> AppState:
     payload = state.get("payload", {})
     qa_intent = str(payload.get("qa_intent", "policy")).strip() or "policy"
     simple_res = rule_retrieve(query, payload.get("rules_path"))
-    items = simple_res.data.get("items", [])
+    rule_items = simple_res.data.get("items", [])
+    items = rule_items if isinstance(rule_items, list) else []
     retrieval = "rule_retrieve"
     score_threshold = get_policy_value(payload, "qa_kb_score_threshold", 0.55, legacy_keys=("kb_score_threshold",))
-    if not items:
-        top_k = get_int_policy(payload, "qa_kb_top_k", 4, legacy_keys=("kb_top_k",))
-        rag_res = rag_retrieve(
-            query,
-            payload.get("kb_path"),
-            top_k=top_k,
-            score_threshold=score_threshold,
+    top_k = get_int_policy(payload, "qa_kb_top_k", 4, legacy_keys=("kb_top_k",))
+    rag_res = rag_retrieve(
+        query,
+        payload.get("kb_path"),
+        top_k=top_k,
+        score_threshold=score_threshold,
+    )
+    rag_items_raw = rag_res.data.get("items", [])
+    rag_items = rag_items_raw if isinstance(rag_items_raw, list) else []
+
+    merged_items = []
+    seen_signatures = set()
+    for item in [*items, *rag_items]:
+        if not isinstance(item, dict):
+            continue
+        signature = (
+            str(item.get("source", "")).strip(),
+            str(item.get("title", "")).strip(),
+            str(item.get("content", "")).strip(),
         )
-        items = rag_res.data.get("items", [])
-        retrieval = rag_res.data.get("retrieval", "rag_retrieve")
+        if signature in seen_signatures:
+            continue
+        seen_signatures.add(signature)
+        merged_items.append(item)
+    items = merged_items
+    retrieval = "rule+rag" if items else rag_res.data.get("retrieval", "rag_retrieve")
     answer_res = answer_generate(query, items, min_score=float(score_threshold or 0.0), intent=qa_intent)
     workflow_hint = build_workflow_hint(query)
     errors = list(state.get("errors", []))
     if simple_res.error:
         errors.append(simple_res.error)
-    if not items and "rag_res" in locals() and rag_res.error:
+    if rag_res.error:
         errors.append(rag_res.error)
     if answer_res.error:
         errors.append(answer_res.error)

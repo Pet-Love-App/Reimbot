@@ -5,6 +5,7 @@ import datetime
 import hashlib
 import json
 import os
+import queue
 import re
 import signal
 import sys
@@ -55,6 +56,7 @@ SYSTEM_PROMPT = (
     "你是企业报销与办公任务助手。"
     "请使用自然、友好、专业的中文回答，先理解用户真实目标，再给出结论。"
     "默认采用“结论 + 关键步骤 + 注意事项”的结构，尽量短句表达，避免堆砌术语。"
+    "输出优先使用 Markdown 分段：段落之间空一行，关键点用无序列表，必要时给出小标题。"
     "当信息不足时，先给一个可执行的初步方案，再明确指出需要用户补充的关键信息。"
     "若涉及编辑文件但目标文件或改动范围不明确，先用一句话确认路径/文件名后再执行。"
     "若用户询问报销审计规则，请结合常见合规点和风险等级给出建议；"
@@ -1643,6 +1645,13 @@ def _prepare_task_payload_for_dispatch(
     if workspace_dir:
         merged_payload["workspace_dir"] = workspace_dir
         merged_payload.setdefault("workspace_root", workspace_dir)
+    if task_type == "reimburse" and workspace_dir and not str(merged_payload.get("output_dir", "")).strip():
+        merged_payload["output_dir"] = str(Path(workspace_dir))
+    if task_type == "reimburse":
+        raw_paths = merged_payload.get("paths", [])
+        safe_paths = [str(item).strip() for item in raw_paths if str(item).strip()] if isinstance(raw_paths, list) else []
+        if not safe_paths and workspace_dir:
+            merged_payload["paths"] = [workspace_dir]
 
     referenced_files = _referenced_file_paths(merged_payload)
     should_prepare_file_actions = (
@@ -1905,6 +1914,46 @@ def _format_task_reply(task_type: str, result: Dict[str, Any]) -> str:
         message = str(result.get("message", "")).strip()
         return message or "当前请求信息不足，请补充目标与输入范围后重试。"
 
+    if normalized_task == "reimburse" or result_type == "reimburse":
+        if result_status == "failed":
+            errors = result.get("errors", []) if isinstance(result.get("errors", []), list) else []
+            if errors:
+                return "报销任务失败：\n" + "\n".join(f"- {str(item)}" for item in errors[:3])
+            return "报销任务失败，请检查输入文件与字段后重试。"
+
+        outputs = result.get("outputs", {}) if isinstance(result.get("outputs", {}), dict) else {}
+        word_path = str(outputs.get("word_path", "")).strip()
+        excel_path = str(outputs.get("excel_path", "")).strip()
+        eml_path = str(outputs.get("eml_path", "")).strip()
+        record_id = result.get("record_id")
+        details: List[str] = []
+        if record_id not in (None, ""):
+            details.append(f"- 记录ID：{record_id}")
+        if word_path:
+            details.append(f"- Word：{word_path}")
+        if excel_path:
+            details.append(f"- Excel：{excel_path}")
+        if eml_path:
+            details.append(f"- EML：{eml_path}")
+
+        ocr_summary = result.get("ocr_summary", {}) if isinstance(result.get("ocr_summary", {}), dict) else {}
+        pdf_total = int(ocr_summary.get("pdf_total", 0) or 0)
+        pdf_ocr_success = int(ocr_summary.get("pdf_ocr_success", 0) or 0)
+        image_total = int(ocr_summary.get("image_total", 0) or 0)
+        image_ocr_success = int(ocr_summary.get("image_ocr_success", 0) or 0)
+        if pdf_total > 0 or image_total > 0:
+            details.append(
+                f"- OCR 摘要：PDF {pdf_ocr_success}/{pdf_total}，图片 {image_ocr_success}/{image_total}"
+            )
+
+        if details:
+            return "报销任务已完成。\n" + "\n".join(details)
+
+        errors = result.get("errors", []) if isinstance(result.get("errors", []), list) else []
+        if errors:
+            return "报销任务已完成，但未生成文件：\n" + "\n".join(f"- {str(item)}" for item in errors[:3])
+        return "报销任务已完成，但未生成可用输出文件。请确认目录内是否包含可识别发票文件。"
+
     if normalized_task == "recon" or result_type == "recon":
         summary = result.get("summary", {}) if isinstance(result.get("summary", {}), dict) else {}
         total_items = int(summary.get("total_items", 0) or 0)
@@ -1995,6 +2044,37 @@ def _format_task_reply(task_type: str, result: Dict[str, Any]) -> str:
         if detail_lines:
             return base + "\n" + "\n".join(detail_lines)
         return base
+
+    if normalized_task == "budget" or result_type == "budget":
+        if result_status == "needs_clarification":
+            message = str(result.get("message", "")).strip()
+            return message or "预算填表所需数据不足，请补充预算/决算数据或上传模板后重试。"
+        if result_status == "failed":
+            errors = result.get("errors", []) if isinstance(result.get("errors", []), list) else []
+            if errors:
+                return "预算任务失败：\n" + "\n".join(f"- {str(item)}" for item in errors[:3])
+            return "预算任务失败，请检查输入数据与模板。"
+        budget_path = str(result.get("budget_path", "")).strip()
+        report_path = str(result.get("report_path", "")).strip()
+        details: List[str] = []
+        if budget_path:
+            details.append(f"- 预算文件：{budget_path}")
+        if report_path:
+            details.append(f"- 报告文件：{report_path}")
+        if details:
+            return "预算任务已完成。\n" + "\n".join(details)
+        return "预算任务已完成。"
+
+    if normalized_task == "final_account" or result_type == "final_account":
+        if result_status == "failed":
+            errors = result.get("errors", []) if isinstance(result.get("errors", []), list) else []
+            if errors:
+                return "决算任务失败：\n" + "\n".join(f"- {str(item)}" for item in errors[:3])
+            return "决算任务失败，请检查输入数据后重试。"
+        final_account_path = str(result.get("final_account_path", "")).strip()
+        if final_account_path:
+            return f"决算任务已完成。\n- 决算文件：{final_account_path}"
+        return "决算任务已完成。"
 
     if normalized_task == "file_edit" or result_type == "file_edit":
         status = str(result.get("status", "unknown"))
@@ -2233,16 +2313,75 @@ def handle_request_stream(request: Dict[str, Any]) -> Iterator[Dict[str, Any]]:
             task_type=effective_task_type,
         )
         yield {"type": "status", "status": f"正在执行任务: {effective_task_type}"}
-        task_resp = _run_v2_task(effective_task_type, prepared_task_payload)
-        for step in task_resp.get("task_progress", []):
-            step_name = str(step.get("step", ""))
-            tool_name = str(step.get("tool_name", ""))
-            yield {"type": "status", "status": f"步骤: {step_name} | Tool: {tool_name}"}
-        reply = str(task_resp.get("reply", "任务完成"))
-        _remember_turn(payload, message, reply)
-        for chunk in _iter_text_chunks(reply):
-            yield {"type": "delta", "delta": chunk}
-        yield {"type": "done", "response": {"ok": True, **task_resp}}
+
+        event_queue: "queue.Queue[Dict[str, Any]]" = queue.Queue()
+        progress_events: List[Dict[str, Any]] = []
+
+        def _task_worker() -> None:
+            try:
+                from agent import EventBus, TaskDispatcher  # noqa: WPS433
+            except ModuleNotFoundError as exc:
+                event_queue.put({"type": "error", "error": str(exc)})
+                return
+
+            event_bus = EventBus()
+
+            def _on_progress(evt: Dict[str, Any]) -> None:
+                event_queue.put({"type": "progress", "event": evt})
+
+            event_bus.subscribe("task_progress", _on_progress)
+            dispatcher = TaskDispatcher(event_bus)
+            try:
+                task_result = dispatcher.dispatch(effective_task_type, prepared_task_payload)
+                event_queue.put({"type": "result", "result": task_result})
+            except Exception as exc:
+                event_queue.put({"type": "error", "error": str(exc)})
+
+        worker = threading.Thread(target=_task_worker, daemon=True)
+        worker.start()
+
+        while True:
+            try:
+                item = event_queue.get(timeout=0.15)
+            except queue.Empty:
+                if worker.is_alive():
+                    continue
+                # Worker exited unexpectedly without emitting terminal event.
+                err_text = "任务执行中断，未返回结果。"
+                yield {"type": "error", "error": err_text}
+                break
+
+            item_type = str(item.get("type", ""))
+            if item_type == "progress":
+                step = item.get("event", {})
+                if isinstance(step, dict):
+                    progress_events.append(step)
+                    status_text = str(step.get("status", "")).strip()
+                    if status_text:
+                        yield {"type": "status", "status": status_text}
+                continue
+
+            if item_type == "result":
+                raw_result = item.get("result", {})
+                result = raw_result if isinstance(raw_result, dict) else {}
+                reply = _format_task_reply(effective_task_type, result)
+                task_resp = {
+                    "reply": reply,
+                    "mode": "task",
+                    "task_type": effective_task_type,
+                    "task_result": result,
+                    "task_progress": progress_events,
+                }
+                _remember_turn(payload, message, reply)
+                for chunk in _iter_text_chunks(reply):
+                    yield {"type": "delta", "delta": chunk}
+                yield {"type": "done", "response": {"ok": True, **task_resp}}
+                break
+
+            if item_type == "error":
+                err_text = str(item.get("error", "")).strip() or "任务执行失败"
+                yield {"type": "error", "error": err_text}
+                break
         return
 
     yield {"type": "status", "status": "正在分析意图..."}

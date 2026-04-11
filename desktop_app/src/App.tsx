@@ -23,7 +23,7 @@ import type {
 } from "./types/trace";
 import { useThemeMode } from "./theme";
 
-type TaskType = "qa" | "reimburse" | "final_account" | "budget";
+type TaskType = "qa" | "reimburse" | "final_account" | "budget" | "budget_fill" | "final_fill";
 
 type FileTreeNode = {
   name: string;
@@ -68,6 +68,8 @@ const TASK_META: Record<TaskType, { label: string; demo: string }> = {
   reimburse: { label: "单次报销", demo: "2026-03-10 在教室举办活动，产生交通支出" },
   final_account: { label: "年度决算", demo: "请生成年度决算" },
   budget: { label: "预算生成", demo: "请生成下一年度预算" },
+  budget_fill: { label: "预算填表", demo: "请填写预算表中的预算金额与说明" },
+  final_fill: { label: "决算填表", demo: "请填写决算表中的实际支出与说明" },
 };
 
 const TRACE_OPERATION_LABEL: Record<TraceOperation, string> = {
@@ -952,25 +954,49 @@ export default function App() {
 
   const getTaskPayload = (task: TaskType, text: string, chatSessionId: string): Record<string, unknown> => {
     const sessionPayload = chatSessionId ? { chat_session_id: chatSessionId } : {};
+    const workspacePayload = rootDir
+      ? {
+          workspace_dir: rootDir,
+          workspace_root: rootDir,
+        }
+      : {};
     if (task === "qa") {
-      return { ...sessionPayload, query: text };
+      return { ...sessionPayload, ...workspacePayload, query: text };
     }
     if (task === "reimburse") {
       return {
         ...sessionPayload,
+        ...workspacePayload,
         paths: currentFile ? [currentFile] : [],
         activity_text: text,
         rules: { max_amount: 50000, required_activity_date: true },
       };
     }
-    if (task === "final_account") {
-      return { ...sessionPayload, filters: {} };
+    if (task === "final_account" || task === "final_fill") {
+      return { ...sessionPayload, ...workspacePayload, filters: {} };
     }
     return {
       ...sessionPayload,
+      ...workspacePayload,
       aggregate: {},
       strategy: { growth_rate: 0.08 },
+      fill_mode: task === "budget_fill",
     };
+  };
+
+  const deriveDispatchTaskType = (task: TaskType, text: string): TaskType => {
+    const normalized = text.trim();
+    const hasFillIntent = /填写|填报|回填|填入|写入/.test(normalized);
+    if (!hasFillIntent) {
+      return task;
+    }
+    if (task === "budget") {
+      return "budget_fill";
+    }
+    if (task === "final_account") {
+      return "final_fill";
+    }
+    return task;
   };
 
   const getTaskDemoPrompt = (task: TaskType): string => {
@@ -998,7 +1024,7 @@ export default function App() {
       );
     }
 
-    if (task === "final_account") {
+    if (task === "final_account" || task === "final_fill") {
       return `\n\n### 任务结果\n- 任务类型: ${TASK_META[task].label}\n- 决算文件: ${String(taskResult.final_account_path ?? "")}`;
     }
 
@@ -1007,6 +1033,29 @@ export default function App() {
       `\n- 预算文件: ${String(taskResult.budget_path ?? "")}` +
       `\n- 报告文件: ${String(taskResult.report_path ?? "")}`
     );
+  };
+
+  const shouldAppendTaskResult = (task: TaskType, taskResult?: Record<string, unknown>): boolean => {
+    if (!taskResult) {
+      return false;
+    }
+    const status = String(taskResult.status ?? "").trim().toLowerCase();
+    if (status === "failed" || status === "needs_clarification" || status === "pending_confirmation") {
+      return false;
+    }
+    if (task === "reimburse") {
+      const outputs = (taskResult.outputs as Record<string, unknown>) || {};
+      return Boolean(
+        taskResult.record_id || outputs.word_path || outputs.excel_path || outputs.eml_path
+      );
+    }
+    if (task === "final_account" || task === "final_fill") {
+      return Boolean(taskResult.final_account_path);
+    }
+    if (task === "budget" || task === "budget_fill") {
+      return Boolean(taskResult.budget_path || taskResult.report_path);
+    }
+    return false;
   };
 
   const getTaskOutputPaths = (task: TaskType, taskResult: Record<string, unknown>): string[] => {
@@ -1018,10 +1067,10 @@ export default function App() {
         String(outputs.eml_path ?? ""),
       ].filter(Boolean);
     }
-    if (task === "final_account") {
+    if (task === "final_account" || task === "final_fill") {
       return [String(taskResult.final_account_path ?? "")].filter(Boolean);
     }
-    if (task === "budget") {
+    if (task === "budget" || task === "budget_fill") {
       return [String(taskResult.budget_path ?? ""), String(taskResult.report_path ?? "")].filter(Boolean);
     }
     return [];
@@ -1197,8 +1246,9 @@ export default function App() {
     ];
     const referencedContext = await buildReferencedContext();
     const activeChatSessionId = await resolveActiveChatSessionId();
+    const effectiveTaskType = deriveDispatchTaskType(selectedTask, text);
     const taskPayload = {
-      ...getTaskPayload(selectedTask, text, activeChatSessionId),
+      ...getTaskPayload(effectiveTaskType, text, activeChatSessionId),
       referenced_files: referencedContext.referencedPaths,
       referenced_file_context: referencedContext.referencedContextText,
     };
@@ -1206,7 +1256,7 @@ export default function App() {
     const historyId = `${Date.now()}-${Math.random().toString(16).slice(2, 8)}`;
     pushTaskHistory({
       id: historyId,
-      taskType: selectedTask,
+      taskType: effectiveTaskType,
       inputText: text,
       payload: taskPayload,
       status: "running",
@@ -1236,10 +1286,10 @@ export default function App() {
               referenced_file_context: referencedContext.referencedContextText,
             })
           : typeof (bridge as any).runAgentTask === "function"
-            ? (bridge as any).runAgentTask(selectedTask, taskPayload)
+            ? (bridge as any).runAgentTask(effectiveTaskType, taskPayload)
             : bridge.chatWithAgent(text, {
                 history: historyForAgent,
-                task_type: selectedTask,
+                task_type: effectiveTaskType,
                 task_payload: taskPayload,
                 chat_session_id: activeChatSessionId,
                 referenced_files: referencedContext.referencedPaths,
@@ -1260,9 +1310,9 @@ export default function App() {
         if (response.report_markdown) {
           content += `\n\n${response.report_markdown}`;
         }
-        if (response.mode === "task" && response.task_result) {
-          content += formatTaskResult(selectedTask, response.task_result);
-          setTaskSummary({ taskType: selectedTask, result: response.task_result });
+        if (response.mode === "task" && response.task_result && shouldAppendTaskResult(effectiveTaskType, response.task_result)) {
+          content += formatTaskResult(effectiveTaskType, response.task_result);
+          setTaskSummary({ taskType: effectiveTaskType, result: response.task_result });
         }
         updateTaskHistory(historyId, { status: "success", error: undefined });
 
@@ -1327,9 +1377,9 @@ export default function App() {
         if (response.report_markdown && !finalContent.includes(response.report_markdown)) {
           finalContent += `\n\n${response.report_markdown}`;
         }
-        if (response.mode === "task" && response.task_result) {
-          finalContent += formatTaskResult(selectedTask, response.task_result);
-          setTaskSummary({ taskType: selectedTask, result: response.task_result });
+        if (response.mode === "task" && response.task_result && shouldAppendTaskResult(effectiveTaskType, response.task_result)) {
+          finalContent += formatTaskResult(effectiveTaskType, response.task_result);
+          setTaskSummary({ taskType: effectiveTaskType, result: response.task_result });
         }
         updateTaskHistory(historyId, { status: "success", error: undefined });
         replaceLastAgentMessage(finalContent);
@@ -1350,10 +1400,10 @@ export default function App() {
               referenced_file_context: referencedContext.referencedContextText,
             })
           : typeof (bridge as any).startAgentTaskStream === "function"
-            ? (bridge as any).startAgentTaskStream(selectedTask, taskPayload)
+            ? (bridge as any).startAgentTaskStream(effectiveTaskType, taskPayload)
             : bridge.startAgentChatStream(text, {
                 history: historyForAgent,
-                task_type: selectedTask,
+                task_type: effectiveTaskType,
                 task_payload: taskPayload,
                 chat_session_id: activeChatSessionId,
                 referenced_files: referencedContext.referencedPaths,
@@ -1361,7 +1411,7 @@ export default function App() {
               }));
         startedChatId = started.chatId;
         updateLastAgentMessageStatus(
-          useWorkspaceMode ? "正在执行目录编辑..." : `正在执行任务: ${selectedTask}...`
+          useWorkspaceMode ? "正在执行目录编辑..." : `正在执行任务: ${effectiveTaskType}...`
         );
       } catch (startErr) {
         stopListening();
@@ -1665,6 +1715,8 @@ export default function App() {
                 { value: "reimburse", label: TASK_META.reimburse.label },
                 { value: "final_account", label: TASK_META.final_account.label },
                 { value: "budget", label: TASK_META.budget.label },
+                { value: "budget_fill", label: TASK_META.budget_fill.label },
+                { value: "final_fill", label: TASK_META.final_fill.label },
               ]}
             />
           </div>

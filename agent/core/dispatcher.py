@@ -41,9 +41,7 @@ class TaskDispatcher:
             "result": {},
         }
         try:
-            final_state = self.graph.invoke(initial_state)
-            for step in final_state.get("task_progress", []):
-                self.event_bus.publish("task_progress", {**step, "trace_id": trace_id})
+            final_state = self._invoke_with_progress_stream(initial_state, trace_id)
             result = final_state.get("result", {})
             if isinstance(result, dict):
                 result = {**result, "trace_id": trace_id}
@@ -54,3 +52,36 @@ class TaskDispatcher:
         except Exception as exc:
             self.event_bus.publish("task_error", {"task_type": task_type, "message": str(exc), "trace_id": trace_id})
             raise
+
+    def _invoke_with_progress_stream(self, initial_state: AppState, trace_id: str) -> Dict[str, Any]:
+        """Invoke graph and emit progress incrementally when streaming is available."""
+        last_progress_count = 0
+        final_state: Optional[Dict[str, Any]] = None
+
+        if hasattr(self.graph, "stream"):
+            try:
+                for snapshot in self.graph.stream(initial_state, stream_mode="values"):
+                    if not isinstance(snapshot, dict):
+                        continue
+                    final_state = snapshot
+                    progress = snapshot.get("task_progress", [])
+                    if not isinstance(progress, list):
+                        continue
+                    new_steps = progress[last_progress_count:]
+                    for step in new_steps:
+                        if isinstance(step, dict):
+                            self.event_bus.publish("task_progress", {**step, "trace_id": trace_id})
+                    last_progress_count = len(progress)
+            except Exception:
+                # Fall back to non-stream invoke for compatibility with older graph runtimes.
+                final_state = None
+
+        if final_state is None:
+            final_state = self.graph.invoke(initial_state)
+            progress = final_state.get("task_progress", [])
+            if isinstance(progress, list):
+                for step in progress:
+                    if isinstance(step, dict):
+                        self.event_bus.publish("task_progress", {**step, "trace_id": trace_id})
+
+        return final_state

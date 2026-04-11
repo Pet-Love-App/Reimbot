@@ -288,6 +288,8 @@ body[data-theme="dark"] .pet-chat-badge.warn {
 .pet-chat-msg-content .markdown-content {
   font-size: 13px;
   line-height: 1.55;
+  white-space: pre-wrap;
+  word-break: break-word;
 }
 
 .pet-chat-msg-content .markdown-content p {

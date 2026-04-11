@@ -35,6 +35,15 @@ from agent.graphs.names import (
     NODE_QA_FALLBACK,
     NODE_QA_START,
     NODE_QUESTION_UNDERSTAND,
+    NODE_RECON_COMPARE,
+    NODE_RECON_COMPLIANCE,
+    NODE_RECON_FAIL,
+    NODE_RECON_GENERATE,
+    NODE_RECON_LOAD,
+    NODE_RECON_MATERIAL,
+    NODE_RECON_NORMALIZE,
+    NODE_RECON_START,
+    NODE_RECON_SUGGEST,
     NODE_REIMBURSE_FAIL,
     NODE_REIMBURSE_START,
     NODE_RULE_CHECK,
@@ -50,6 +59,7 @@ from agent.graphs.spec import (
     FINAL_LOAD_ROUTES,
     INTENT_ROUTES,
     QA_UNDERSTAND_ROUTES,
+    RECON_NORMALIZE_ROUTES,
     REIMBURSE_EXTRACT_ROUTES,
     REIMBURSE_RULE_ROUTES,
     REIMBURSE_SCAN_ROUTES,
@@ -76,6 +86,18 @@ from agent.graphs.subgraphs.final_account import (
     route_after_load_records,
 )
 from agent.graphs.subgraphs.qa import qa_fallback_node, qa_start_node, question_understand_node, route_after_understand, rule_retrieve_node
+from agent.graphs.subgraphs.recon import (
+    recon_compare_node,
+    recon_compliance_node,
+    recon_fail_node,
+    recon_generate_node,
+    recon_load_node,
+    recon_material_node,
+    recon_normalize_node,
+    recon_start_node,
+    recon_suggest_node,
+    route_after_recon_normalize,
+)
 from agent.graphs.subgraphs.reimburse import (
     activity_parse_node,
     classify_file_node,
@@ -124,6 +146,15 @@ def _register_nodes(graph: StateGraph) -> None:
         NODE_DATA_AGGREGATE: aggregate_node,
         NODE_FINAL_GENERATE: final_generate_node,
         NODE_FINAL_FAIL: final_fail_node,
+        NODE_RECON_START: recon_start_node,
+        NODE_RECON_LOAD: recon_load_node,
+        NODE_RECON_NORMALIZE: recon_normalize_node,
+        NODE_RECON_COMPARE: recon_compare_node,
+        NODE_RECON_COMPLIANCE: recon_compliance_node,
+        NODE_RECON_SUGGEST: recon_suggest_node,
+        NODE_RECON_MATERIAL: recon_material_node,
+        NODE_RECON_GENERATE: recon_generate_node,
+        NODE_RECON_FAIL: recon_fail_node,
         NODE_BUDGET_START: budget_start_node,
         NODE_LOAD_FINAL_DATA: load_final_data_node,
         NODE_BUDGET_CALCULATE: budget_calculate_node,
@@ -240,6 +271,23 @@ def _connect_budget_flow(graph: StateGraph) -> None:
     graph.add_edge(NODE_BUDGET_FAIL, END)
 
 
+def _connect_recon_flow(graph: StateGraph) -> None:
+    _validate_route_map("recon.normalize", RECON_NORMALIZE_ROUTES, allowed_targets=ALL_GRAPH_NODES)
+    graph.add_edge(NODE_RECON_START, NODE_RECON_LOAD)
+    graph.add_edge(NODE_RECON_LOAD, NODE_RECON_NORMALIZE)
+    graph.add_conditional_edges(
+        NODE_RECON_NORMALIZE,
+        route_after_recon_normalize,
+        RECON_NORMALIZE_ROUTES,
+    )
+    graph.add_edge(NODE_RECON_COMPARE, NODE_RECON_COMPLIANCE)
+    graph.add_edge(NODE_RECON_COMPLIANCE, NODE_RECON_SUGGEST)
+    graph.add_edge(NODE_RECON_SUGGEST, NODE_RECON_MATERIAL)
+    graph.add_edge(NODE_RECON_MATERIAL, NODE_RECON_GENERATE)
+    graph.add_edge(NODE_RECON_GENERATE, END)
+    graph.add_edge(NODE_RECON_FAIL, END)
+
+
 def _connect_sandbox_flow(graph: StateGraph) -> None:
     graph.add_edge(NODE_SANDBOX_START, NODE_SANDBOX_EXECUTE)
     graph.add_edge(NODE_SANDBOX_EXECUTE, END)
@@ -291,6 +339,7 @@ def build_main_graph() -> Any:
     _connect_qa_flow(graph)
     _connect_final_flow(graph)
     _connect_budget_flow(graph)
+    _connect_recon_flow(graph)
     _connect_sandbox_flow(graph)
     _connect_file_edit_flow(graph)
     return graph.compile()

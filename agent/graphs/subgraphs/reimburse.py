@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Dict, List
 
 from agent.graphs.policy import get_bool_policy
@@ -17,6 +18,16 @@ from agent.tools import (
     scan_inputs,
     send_or_export_email,
 )
+
+
+def _resolve_output_dir(payload: dict) -> str | None:
+    explicit = str(payload.get("output_dir", "")).strip()
+    if explicit:
+        return explicit
+    workspace_dir = str(payload.get("workspace_dir", "") or payload.get("workspace_root", "")).strip()
+    if not workspace_dir:
+        return None
+    return str(Path(workspace_dir))
 
 
 def _append_error(state: AppState, message: str) -> Dict[str, List[str]]:
@@ -71,7 +82,20 @@ def reimburse_start_node(state: AppState) -> AppState:
 
 def scan_file_node(state: AppState) -> AppState:
     payload = state.get("payload", {})
-    paths: List[str] = list(payload.get("paths", []))
+    raw_paths = payload.get("paths", [])
+    if isinstance(raw_paths, list):
+        paths: List[str] = [str(item).strip() for item in raw_paths if str(item).strip()]
+    elif isinstance(raw_paths, str):
+        single = raw_paths.strip()
+        paths = [single] if single else []
+    else:
+        paths = []
+
+    if not paths:
+        workspace_root = str(payload.get("workspace_dir", "") or payload.get("workspace_root", "")).strip()
+        if workspace_root:
+            paths = [workspace_root]
+
     res = scan_inputs(paths)
     if not res.success:
         return {
@@ -102,18 +126,54 @@ def classify_file_node(state: AppState) -> AppState:
 
 
 def extract_node(state: AppState) -> AppState:
-    res = extract_text_from_files(state.get("classified_files", {}))
+    payload = state.get("payload", {}) if isinstance(state.get("payload", {}), dict) else {}
+    raw_force_ocr = payload.get("invoice_ocr", True)
+    if isinstance(raw_force_ocr, bool):
+        prefer_ocr_for_pdf = raw_force_ocr
+    else:
+        prefer_ocr_for_pdf = str(raw_force_ocr).strip().lower() not in {"0", "false", "off", "no"}
+
+    res = extract_text_from_files(
+        state.get("classified_files", {}),
+        prefer_ocr_for_pdf=prefer_ocr_for_pdf,
+    )
     if not res.success:
         return {
             **state,
             "errors": state.get("errors", []) + [res.error or "extract_text_from_files 失败"],
-            "task_progress": state.get("task_progress", []) + [{"step": "extract", "tool_name": "extract_text_from_files"}],
+            "task_progress": state.get("task_progress", [])
+            + [
+                {
+                    "step": "extract",
+                    "tool_name": "extract_text_from_files",
+                    "status": "OCR 提取阶段失败，已记录错误。",
+                }
+            ],
         }
+
+    ocr_summary = res.data.get("ocr_summary", {}) if isinstance(res.data.get("ocr_summary", {}), dict) else {}
+    pdf_total = int(ocr_summary.get("pdf_total", 0) or 0)
+    pdf_ocr_success = int(ocr_summary.get("pdf_ocr_success", 0) or 0)
+    image_total = int(ocr_summary.get("image_total", 0) or 0)
+    image_ocr_success = int(ocr_summary.get("image_ocr_success", 0) or 0)
+    ocr_status_text = (
+        f"OCR 阶段完成：PDF {pdf_ocr_success}/{pdf_total} 页文件识别成功，"
+        f"图片 {image_ocr_success}/{image_total} 识别成功。"
+    )
+
     return {
         **state,
         "merged_text": res.data.get("merged_text", ""),
         "file_text_map": res.data.get("file_text_map", {}),
-        "task_progress": state.get("task_progress", []) + [{"step": "extract", "tool_name": "extract_text_from_files"}],
+        "ocr_summary": ocr_summary,
+        "task_progress": state.get("task_progress", [])
+        + [
+            {
+                "step": "extract",
+                "tool_name": "extract_text_from_files",
+                "status": ocr_status_text,
+            }
+        ],
     }
 
 
@@ -124,7 +184,7 @@ def invoice_extract_node(state: AppState) -> AppState:
     
     # 处理每个文件的文本
     for file_path, text in file_text_map.items():
-        if text and "[OCR ERROR" not in text:
+        if text and "[OCR ERROR" not in text and "OCR 失败" not in text:
             res = extract_invoice_fields(text)
             if res.success:
                 invoice = res.data.get("invoice", {})
@@ -248,7 +308,8 @@ def collect_info_node(state: AppState) -> AppState:
 def gen_doc_node(state: AppState) -> AppState:
     invoices = state.get("invoices", [])
     activity = state.get("activity", {})
-    out_dir = state.get("payload", {}).get("output_dir")
+    payload = state.get("payload", {}) if isinstance(state.get("payload", {}), dict) else {}
+    out_dir = _resolve_output_dir(payload)
     total_amount = state.get("total_amount", 0.0)
     
     # 增强 activity 数据，添加模板需要的字段
@@ -314,13 +375,15 @@ def gen_doc_node(state: AppState) -> AppState:
 def gen_mail_node(state: AppState) -> AppState:
     outputs = state.get("outputs", {})
     total_amount = state.get("total_amount", 0.0)
+    payload = state.get("payload", {}) if isinstance(state.get("payload", {}), dict) else {}
+    out_dir = _resolve_output_dir(payload)
     draft_res = generate_email_draft(
         activity=state.get("activity", {}),
         summary={"total_amount": total_amount},
         attachments=[outputs.get("word_path", ""), outputs.get("excel_path", "")],
     )
     draft = draft_res.data.get("draft", {}) if draft_res.success else {}
-    send_res = send_or_export_email(draft, state.get("payload", {}).get("output_dir"))
+    send_res = send_or_export_email(draft, out_dir)
     errors = list(state.get("errors", []))
     if not draft_res.success:
         errors.append(draft_res.error or "generate_email_draft 失败")
@@ -344,12 +407,14 @@ def save_record_node(state: AppState) -> AppState:
         "activity": state.get("activity", {}),
         "rule_result": state.get("rule_result", {}),
         "outputs": state.get("outputs", {}),
+        "ocr_summary": state.get("ocr_summary", {}),
     }
     save_res = save_record(record)
     result = {
         "type": "reimburse",
         "record_id": save_res.data.get("record_id"),
         "outputs": state.get("outputs", {}),
+        "ocr_summary": state.get("ocr_summary", {}),
         "rule_result": state.get("rule_result", {}),
         "errors": state.get("errors", []),
     }
@@ -370,6 +435,7 @@ def reimburse_fail_node(state: AppState) -> AppState:
             "status": "failed",
             "errors": errors,
             "outputs": state.get("outputs", {}),
+            "ocr_summary": state.get("ocr_summary", {}),
         },
         "errors": errors,
         "task_progress": state.get("task_progress", []) + [{"step": "reimburse_fail", "tool_name": "fail_fast_guard"}],

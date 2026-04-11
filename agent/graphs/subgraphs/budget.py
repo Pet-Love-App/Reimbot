@@ -1,8 +1,20 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 from agent.graphs.policy import get_bool_policy
 from agent.graphs.state import AppState
 from agent.tools import budget_calculate, generate_budget, generate_report, load_final_data
+
+
+def _resolve_output_dir(payload: dict, default_subdir: str) -> str | None:
+    explicit = str(payload.get("output_dir", "")).strip()
+    if explicit:
+        return explicit
+    workspace_dir = str(payload.get("workspace_dir", "") or payload.get("workspace_root", "")).strip()
+    if not workspace_dir:
+        return None
+    return str(Path(workspace_dir))
 
 
 def budget_start_node(state: AppState) -> AppState:
@@ -42,8 +54,27 @@ def budget_calculate_node(state: AppState) -> AppState:
 def budget_generate_node(state: AppState) -> AppState:
     budget = state.get("budget", {})
     aggregate = state.get("aggregate", {})
-    budget_res = generate_budget(budget, state.get("payload", {}).get("output_dir"))
-    report_res = generate_report(aggregate, budget, state.get("payload", {}).get("output_dir"))
+    payload = state.get("payload", {}) if isinstance(state.get("payload", {}), dict) else {}
+    route_decision = state.get("route_decision", {}) if isinstance(state.get("route_decision", {}), dict) else {}
+    inferred_task = str(route_decision.get("task_type", "")).strip().lower()
+    if inferred_task == "budget_fill" and not aggregate:
+        message = "未检测到可用于预算填表的数据，请补充决算汇总、预算明细或上传待填写模板后重试。"
+        return {
+            "result": {
+                "type": "budget",
+                "status": "needs_clarification",
+                "message": message,
+                "errors": state.get("errors", []),
+            },
+            "errors": state.get("errors", []),
+            "task_progress": state.get("task_progress", [])
+            + [{"step": "budget_generate_guard", "tool_name": "missing_budget_fill_data_guard"}],
+        }
+
+    budget_output_dir = _resolve_output_dir(payload, "budget_outputs")
+    report_output_dir = _resolve_output_dir(payload, "report_outputs")
+    budget_res = generate_budget(budget, budget_output_dir)
+    report_res = generate_report(aggregate, budget, report_output_dir)
     errors = state.get("errors", []) + ([budget_res.error] if budget_res.error else []) + ([report_res.error] if report_res.error else [])
     return {
         "outputs": {

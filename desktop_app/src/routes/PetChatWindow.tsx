@@ -387,6 +387,7 @@ export function PetChatWindow() {
     let typewriterPending = "";
     let typewriterTimer: number | null = null;
     let typewriterRunning = false;
+    let hasRenderedFirstDelta = false;
     let streamActive = true;
 
     const clearStreamTimers = () => {
@@ -415,8 +416,24 @@ export function PetChatWindow() {
 
     const pushTypewriterDelta = (delta: string) => {
       if (!delta) return;
-      typewriterPending += delta;
+
+      // Render the first chunk immediately so users perceive instant streaming feedback.
+      if (!hasRenderedFirstDelta) {
+        const firstSliceLength = Math.min(delta.length, 14);
+        const firstSlice = delta.slice(0, firstSliceLength);
+        const rest = delta.slice(firstSliceLength);
+        if (firstSlice) {
+          appendToLastAgentMessage(firstSlice);
+          hasRenderedFirstDelta = true;
+        }
+        if (rest) {
+          typewriterPending += rest;
+        }
+      } else {
+        typewriterPending += delta;
+      }
       if (typewriterRunning) return;
+      if (!typewriterPending) return;
 
       typewriterRunning = true;
       const tick = () => {
@@ -427,14 +444,14 @@ export function PetChatWindow() {
         }
         // Adaptive speed avoids long backlog when model returns big deltas.
         const charsPerTick =
-          typewriterPending.length > 240
-            ? 24
-            : typewriterPending.length > 120
-              ? 14
-              : typewriterPending.length > 60
-                ? 8
-                : 4;
-        const intervalMs = typewriterPending.length > 240 ? 8 : typewriterPending.length > 120 ? 12 : 16;
+          typewriterPending.length > 320
+            ? 30
+            : typewriterPending.length > 160
+              ? 18
+              : typewriterPending.length > 80
+                ? 10
+                : 6;
+        const intervalMs = typewriterPending.length > 320 ? 8 : typewriterPending.length > 160 ? 10 : 14;
         const slice = typewriterPending.slice(0, charsPerTick);
         typewriterPending = typewriterPending.slice(charsPerTick);
         appendToLastAgentMessage(slice);
@@ -515,6 +532,7 @@ export function PetChatWindow() {
     });
 
     try {
+      updateLastAgentMessageStatus("正在连接模型...");
       const started = await window.petChatApi.startChatStream(text, history);
       if (!started || !started.ok || !started.chatId) {
         clearStreamTimers();

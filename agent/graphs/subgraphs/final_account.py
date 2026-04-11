@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 from agent.graphs.policy import get_bool_policy
 from agent.graphs.state import AppState
 from agent.graphs.subgraphs.recon import (
@@ -12,6 +14,16 @@ from agent.graphs.subgraphs.recon import (
     recon_suggest_node,
 )
 from agent.tools import aggregate_records, data_clean, generate_final_account, load_records
+
+
+def _resolve_output_dir(payload: dict) -> str | None:
+    explicit = str(payload.get("output_dir", "")).strip()
+    if explicit:
+        return explicit
+    workspace_dir = str(payload.get("workspace_dir", "") or payload.get("workspace_root", "")).strip()
+    if not workspace_dir:
+        return None
+    return str(Path(workspace_dir))
 
 
 def final_start_node(state: AppState) -> AppState:
@@ -95,7 +107,8 @@ def final_generate_node(state: AppState) -> AppState:
         return _run_recon_compat_chain(state)
 
     aggregate = state.get("aggregate", {"total_amount": 0.0, "count": 0, "by_month": []})
-    res = generate_final_account(aggregate, state.get("payload", {}).get("output_dir"))
+    payload = state.get("payload", {}) if isinstance(state.get("payload", {}), dict) else {}
+    res = generate_final_account(aggregate, _resolve_output_dir(payload))
     errors = state.get("errors", []) + ([res.error] if res.error else [])
     return {
         "outputs": {**state.get("outputs", {}), "final_account_path": res.data.get("final_account_path", "")},
