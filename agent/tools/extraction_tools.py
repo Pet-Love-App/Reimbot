@@ -361,6 +361,9 @@ def extract_text_from_files(
         "image_ocr_success": 0,
     }
 
+    print("\n=== OCR 调试信息 ===")
+    print(f"分类文件: {classified}")
+
     for pdf in classified.get("pdf", []):
         ocr_summary["pdf_total"] = int(ocr_summary["pdf_total"]) + 1
         if prefer_ocr_for_pdf:
@@ -395,6 +398,30 @@ def extract_text_from_files(
     for img in classified.get("image", []):
         ocr_summary["image_total"] = int(ocr_summary["image_total"]) + 1
         ocr_summary["image_ocr_attempted"] = int(ocr_summary["image_ocr_attempted"]) + 1
+        print(f"\n处理 PDF 文件: {pdf}")
+        pdf_res = extract_pdf_text(pdf)
+        if pdf_res.success and pdf_res.data.get("text"):
+            text = str(pdf_res.data["text"])
+            print(f"  PDF 文本提取成功，长度: {len(text)}")
+            file_text_map[pdf] = text
+            texts.append(text)
+            continue
+        # PDF 没有文本层，尝试 OCR
+        print("  PDF 无文本层，尝试 OCR")
+        ocr_res = ocr_extract(pdf)
+        text = str(ocr_res.data.get("text", ""))
+        if text:
+            print(f"  OCR 成功，提取文本长度: {len(text)}")
+            print(f"  OCR 提取内容预览: {text[:200]}...")
+            file_text_map[pdf] = text
+            texts.append(text)
+        else:
+            print("  OCR 失败，无文本提取")
+            file_text_map[pdf] = "[PDF 无文本层且 OCR 失败]"
+            texts.append("[PDF 无文本层且 OCR 失败]")
+
+    for img in classified.get("image", []):
+        print(f"\n处理图片文件: {img}")
         ocr_res = ocr_extract(img)
         text = str(ocr_res.data.get("text", "")).strip()
         if text:
@@ -406,10 +433,13 @@ def extract_text_from_files(
             texts.append("[图片 OCR 失败]")
 
     for txt in classified.get("text", []):
+        print(f"\n处理文本文件: {txt}")
         try:
             content = Path(txt).read_text(encoding="utf-8")
+            print(f"  文本文件读取成功，长度: {len(content)}")
         except UnicodeDecodeError:
             content = Path(txt).read_text(encoding="gbk", errors="ignore")
+            print(f"  文本文件读取成功（使用 GBK 编码），长度: {len(content)}")
         file_text_map[txt] = content
         texts.append(content)
 

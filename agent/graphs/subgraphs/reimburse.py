@@ -74,6 +74,12 @@ def route_after_collect_info(state: AppState) -> str:
 
 
 def reimburse_start_node(state: AppState) -> AppState:
+    print("\n=== reimburse_start_node 状态 ===")
+    print(f"  task_type: {state.get('task_type')}")
+    print(f"  payload: {state.get('payload', {}).keys()}")
+    print(f"  invoices: {state.get('invoices', [])}")
+    print(f"  total_amount: {state.get('total_amount', 0.0)}")
+    print(f"  errors: {state.get('errors', [])}")
     return {
         **state,
         "task_progress": state.get("task_progress", []) + [{"step": "reimburse_start", "tool_name": "start"}]
@@ -81,6 +87,13 @@ def reimburse_start_node(state: AppState) -> AppState:
 
 
 def scan_file_node(state: AppState) -> AppState:
+    print("\n=== scan_file_node 状态 ===")
+    print(f"  task_type: {state.get('task_type')}")
+    print(f"  payload: {state.get('payload', {}).keys()}")
+    print(f"  invoices: {state.get('invoices', [])}")
+    print(f"  total_amount: {state.get('total_amount', 0.0)}")
+    print(f"  errors: {state.get('errors', [])}")
+    
     payload = state.get("payload", {})
     raw_paths = payload.get("paths", [])
     if isinstance(raw_paths, list):
@@ -111,6 +124,13 @@ def scan_file_node(state: AppState) -> AppState:
 
 
 def classify_file_node(state: AppState) -> AppState:
+    print("\n=== classify_file_node 状态 ===")
+    print(f"  task_type: {state.get('task_type')}")
+    print(f"  files: {state.get('files', [])}")
+    print(f"  invoices: {state.get('invoices', [])}")
+    print(f"  total_amount: {state.get('total_amount', 0.0)}")
+    print(f"  errors: {state.get('errors', [])}")
+    
     res = classify_files(state.get("files", []))
     if not res.success:
         return {
@@ -178,6 +198,13 @@ def extract_node(state: AppState) -> AppState:
 
 
 def invoice_extract_node(state: AppState) -> AppState:
+    print("\n=== invoice_extract_node 状态 ===")
+    print(f"  task_type: {state.get('task_type')}")
+    print(f"  file_text_map: {state.get('file_text_map', {}).keys()}")
+    print(f"  invoices: {state.get('invoices', [])}")
+    print(f"  total_amount: {state.get('total_amount', 0.0)}")
+    print(f"  errors: {state.get('errors', [])}")
+    
     file_text_map = state.get("file_text_map", {})
     invoices = []
     total_amount = 0.0
@@ -225,6 +252,19 @@ def invoice_extract_node(state: AppState) -> AppState:
 
 
 def activity_parse_node(state: AppState) -> AppState:
+    print("\n=== activity_parse_node 状态 ===")
+    print(f"  task_type: {state.get('task_type')}")
+    try:
+        print(f"  activity_text: {state.get('payload', {}).get('activity_text', '')}")
+    except UnicodeEncodeError:
+        print(f"  activity_text: 无法打印（包含非ASCII字符）")
+    try:
+        print(f"  invoices: {state.get('invoices', [])}")
+    except UnicodeEncodeError:
+        print(f"  invoices: 无法打印（包含非ASCII字符）")
+    print(f"  total_amount: {state.get('total_amount', 0.0)}")
+    print(f"  errors: {state.get('errors', [])}")
+    
     activity_text = str(state.get("payload", {}).get("activity_text", ""))
     res = parse_activity(activity_text)
     if not res.success:
@@ -242,6 +282,24 @@ def activity_parse_node(state: AppState) -> AppState:
 
 
 def rule_check_node(state: AppState) -> AppState:
+    print("\n=== rule_check_node 状态 ===")
+    print(f"  task_type: {state.get('task_type')}")
+    try:
+        print(f"  invoice: {state.get('invoice', {})}")
+    except UnicodeEncodeError:
+        invoice = state.get('invoice', {})
+        print(f"  invoice: {{'amount': {invoice.get('amount', 0)}, 'invoice_no': {invoice.get('invoice_no', '')}, 'date': {invoice.get('date', '')}, 'content': {invoice.get('content', '')}}}")
+    try:
+        print(f"  activity: {state.get('activity', {})}")
+    except UnicodeEncodeError:
+        print(f"  activity: 无法打印（包含非ASCII字符）")
+    try:
+        print(f"  invoices: {state.get('invoices', [])}")
+    except UnicodeEncodeError:
+        print(f"  invoices: 无法打印（包含非ASCII字符）")
+    print(f"  total_amount: {state.get('total_amount', 0.0)}")
+    print(f"  errors: {state.get('errors', [])}")
+    
     rules = state.get("payload", {}).get("rules", {})
     res = check_rules(state.get("invoice", {}), state.get("activity", {}), rules)
     if not res.success:
@@ -373,6 +431,16 @@ def gen_doc_node(state: AppState) -> AppState:
 
 
 def gen_mail_node(state: AppState) -> AppState:
+    print("\n=== gen_mail_node 状态 ===")
+    print(f"  task_type: {state.get('task_type')}")
+    print(f"  outputs: {state.get('outputs', {})}")
+    try:
+        print(f"  invoices: {state.get('invoices', [])}")
+    except UnicodeEncodeError:
+        print(f"  invoices: 无法打印（包含非ASCII字符）")
+    print(f"  total_amount: {state.get('total_amount', 0.0)}")
+    print(f"  errors: {state.get('errors', [])}")
+    
     outputs = state.get("outputs", {})
     total_amount = state.get("total_amount", 0.0)
     payload = state.get("payload", {}) if isinstance(state.get("payload", {}), dict) else {}
@@ -402,6 +470,21 @@ def gen_mail_node(state: AppState) -> AppState:
 
 
 def save_record_node(state: AppState) -> AppState:
+    print("\n=== save_record_node 状态 ===")
+    print(f"  task_type: {state.get('task_type')}")
+    try:
+        print(f"  invoice: {state.get('invoice', {})}")
+    except UnicodeEncodeError:
+        invoice = state.get('invoice', {})
+        print(f"  invoice: {{'amount': {invoice.get('amount', 0)}, 'invoice_no': {invoice.get('invoice_no', '')}, 'date': {invoice.get('date', '')}, 'content': {invoice.get('content', '')}}}")
+    try:
+        print(f"  invoices: {state.get('invoices', [])}")
+    except UnicodeEncodeError:
+        print(f"  invoices: 无法打印（包含非ASCII字符）")
+    print(f"  total_amount: {state.get('total_amount', 0.0)}")
+    print(f"  outputs: {state.get('outputs', {})}")
+    print(f"  errors: {state.get('errors', [])}")
+    
     record: Dict[str, object] = {
         "invoice": state.get("invoice", {}),
         "activity": state.get("activity", {}),
@@ -417,6 +500,8 @@ def save_record_node(state: AppState) -> AppState:
         "ocr_summary": state.get("ocr_summary", {}),
         "rule_result": state.get("rule_result", {}),
         "errors": state.get("errors", []),
+        "invoices": state.get("invoices", []),
+        "total_amount": state.get("total_amount", 0.0),
     }
     return {
         **state,
